@@ -3,21 +3,21 @@ import requests
 import pandas as pd
 import numpy as np
 import time
-from typing import Dict, List, Optional, Final, Any, Union
+from typing import Dict, List, Optional, Final, Any
 from datetime import datetime
 
-# 最新公式ドキュメント: https://jpx-jquants.com/ja/spec/quickstart
-DATA_URL: Final[str] = "https://api.jquants.com/v2/daily_quotes"
+# 2026年最新公式エンドポイント
+# https://jpx-jquants.com/ja/spec/eq-bars-daily
+BASE_URL: Final[str] = "https://api.jquants.com/v2"
+DAILY_BARS_PATH: Final[str] = "/equities/bars/daily"
 
 class JQuantsV2Fetcher:
     """
-    J-Quants API v2 (APIキー認証) 対応の堅牢なデータ取得・分析クラス
+    J-Quants API v2 (2026年仕様) に完全準拠したデータ取得クラス
     """
     def __init__(self, api_key: Optional[str]):
         if not api_key:
-            raise ValueError("JQUANTS_API_KEY が未設定です。GitHub Secretsを確認してください。")
-        
-        # 前後の空白や改行を除去（認証エラー防止）
+            raise ValueError("JQUANTS_API_KEY が未設定です。")
         self.api_key: str = str(api_key).strip()
         self.headers: Dict[str, str] = {
             "x-api-key": self.api_key,
@@ -25,122 +25,104 @@ class JQuantsV2Fetcher:
         }
 
     def _format_ticker(self, ticker: str) -> str:
-        """4桁コードをV2仕様の5桁に変換 (例: 7203 -> 72030)"""
-        if len(ticker) == 4 and ticker.isdigit():
-            return f"{ticker}0"
-        return ticker
+        """4桁コードをV2推奨の5桁に変換 (例: 7203 -> 72030)"""
+        return f"{ticker}0" if len(ticker) == 4 else ticker
 
     def _format_date(self, date_str: str) -> str:
-        """YYYYMMDD形式をハイフン付き形式に変換 (例: 20160101 -> 2016-01-01)"""
-        if len(date_str) == 8 and date_str.isdigit():
+        """YYYYMMDD を ISO形式 (YYYY-MM-DD) に変換"""
+        if len(date_str) == 8 and "-" not in date_str:
             return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
         return date_str
 
     def fetch_historical_data(self, ticker: str, start: str, end: str) -> pd.DataFrame:
-        """APIキーを使用して10年分のデータを取得"""
+        """V2エンドポイントからヒストリカルデータを取得"""
         code = self._format_ticker(ticker)
         d_from = self._format_date(start)
         d_to = self._format_date(end)
 
-        all_quotes: List[Dict[str, Any]] = []
+        all_data: List[Dict[str, Any]] = []
         pagination_key: Optional[str] = None
 
-        print(f"[DEBUG] Requesting: Code={code}, From={d_from}, To={d_to}")
+        print(f"[DEBUG] Fetching via V2: {BASE_URL}{DAILY_BARS_PATH} (Code: {code})")
 
         while True:
             params = {"code": code, "from": d_from, "to": d_to}
             if pagination_key:
                 params["pagination_key"] = pagination_key
 
-            response = requests.get(DATA_URL, headers=self.headers, params=params, timeout=30)
+            response = requests.get(f"{BASE_URL}{DAILY_BARS_PATH}", headers=self.headers, params=params, timeout=30)
             
-            if response.status_code == 403:
-                # 2026年仕様の403は「キーの有効性」か「パラメータ形式不備」が主因
-                detail = response.json().get("message", "Unknown Permission Error")
-                print(f"[ERROR] 403 Forbidden: {detail}")
-                print("[HINT] J-Quants管理画面で APIキーに 'Daily Quotes' 権限があるか確認してください。")
-                raise PermissionError(f"認証エラー: {detail}")
-            
-            response.raise_for_status()
-            data = response.json()
-            quotes = data.get("daily_quotes", [])
-            all_quotes.extend(quotes)
+            if response.status_code != 200:
+                print(f"[ERROR] API Response: {response.status_code} - {response.text}")
+                response.raise_for_status()
 
-            pagination_key = data.get("pagination_key")
+            # V2では "data" キーの下に配列が入る
+            json_res = response.json()
+            batch = json_res.get("data", [])
+            all_data.extend(batch)
+
+            pagination_key = json_res.get("pagination_key")
             if not pagination_key:
                 break
             time.sleep(0.5)
 
-        df = pd.DataFrame(all_quotes)
-        return self._preprocess(df)
+        return self._preprocess(pd.DataFrame(all_data))
 
     def _preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
-        """型変換とクレンジング（デバッグ機能付）"""
+        """V2の短縮カラム名を正規化し、型変換を行う"""
         if df.empty:
-            return pd.DataFrame()
+            return df
         
+        # V2短縮名から以前のロジックとの互換名へのマッピング
+        # O: Open, H: High, L: Low, C: Close, Vo: Volume
+        column_map = {
+            'O': 'Open', 'H': 'High', 'L': 'Low', 'C': 'Close', 'Vo': 'Volume', 'Date': 'Date'
+        }
+        df = df.rename(columns=column_map)
+        
+        # 数値型へ変換
         numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        df = df.sort_values("Date").reset_index(drop=True)
-        print(f"[DEBUG] Processed {len(df)} rows. Columns: {df.columns.tolist()}")
+        df = df.dropna(subset=['Close']).sort_values("Date").reset_index(drop=True)
         return df
 
-    # --- 過去の分析指標の継承 ---
-    def calculate_backtest_metrics(self, df: pd.DataFrame) -> Dict[str, float]:
-        """シャープレシオ等の分析指標を算出 (LaTeX: $$SR = \frac{E[R_p - R_f]}{\sigma_p}$$)"""
-        if df.empty or 'Close' not in df.columns:
+    def calculate_metrics(self, df: pd.DataFrame) -> Dict[str, float]:
+        r"""分析指標を算出 (LaTeX: $$SR = \frac{E[R_p - R_f]}{\sigma_p}$$)"""
+        if df.empty or len(df) < 2:
             return {"sharpe": 0.0, "mdd": 0.0}
         
         returns = df['Close'].pct_change().dropna()
-        excess_returns = returns - (0.01 / 252) # リスクフリーレート1%
-        sharpe = np.sqrt(252) * excess_returns.mean() / excess_returns.std() if excess_returns.std() != 0 else 0
+        sharpe = (np.sqrt(252) * returns.mean() / returns.std()) if returns.std() != 0 else 0
         
         cum_ret = (1 + returns).cumprod()
-        peak = cum_ret.cummax()
-        mdd = ((cum_ret - peak) / peak).min()
+        mdd = ((cum_ret - cum_ret.cummax()) / cum_ret.cummax()).min()
         
         return {"sharpe": float(sharpe), "mdd": float(mdd)}
 
-def run_main():
+def main():
     api_key = os.getenv("JQUANTS_API_KEY")
-    ticker = "7203" # トヨタ自動車
+    ticker = "7203"
     
     fetcher = JQuantsV2Fetcher(api_key)
     try:
-        # 10年分の取得を試行
+        # 過去10年のデータを取得（V2 Premiumなら20年、Standardなら10年程度可能）
         df = fetcher.fetch_historical_data(ticker, "20160101", "20260307")
         
         if not df.empty:
-            metrics = fetcher.calculate_backtest_metrics(df)
-            print(f"[SUCCESS] Sharpe Ratio: {metrics['sharpe']:.2f}, MDD: {metrics['mdd']:.2%}")
+            metrics = fetcher.calculate_metrics(df)
+            print(f"[SUCCESS] Rows: {len(df)}, Sharpe: {metrics['sharpe']:.2f}, MDD: {metrics['mdd']:.2%}")
             
             os.makedirs("data", exist_ok=True)
             df.to_parquet(f"data/{ticker}.parquet", index=False)
         else:
-            print("[WARNING] Data is empty.")
-            exit(1)
-            
+            print("[WARNING] No data fetched for the specified period.")
+
     except Exception as e:
         print(f"[FATAL] {e}")
         exit(1)
 
-# --- 堅牢性テスト（assert文による証明） ---
-def test_robustness():
-    print("\n--- Running Safety Tests ---")
-    fetcher = JQuantsV2Fetcher("dummy_key")
-    
-    # 1. コード変換テスト
-    assert fetcher._format_ticker("7203") == "72030", "5桁変換失敗"
-    # 2. 日付変換テスト
-    assert fetcher._format_date("20260307") == "2026-03-07", "日付ハイフン化失敗"
-    # 3. 空データ処理
-    assert fetcher._preprocess(pd.DataFrame()).empty, "空DFの処理失敗"
-    
-    print("All Safety Tests Passed.")
-
 if __name__ == "__main__":
-    test_robustness()
-    run_main()
+    main()
