@@ -83,14 +83,41 @@ class AdvancedStrategyAnalyzer:
         if not isinstance(row, pd.Series): raise TypeError("row must be pd.Series")
         if n_chg <= -2.0 or vix >= 20.0: return False
         
-        # 【改修】安全な型変換メソッドを使用して値を取得
         rsi_val = AdvancedStrategyAnalyzer._to_float(row.get('rsi', 50.0), 50.0)
         dev25_val = AdvancedStrategyAnalyzer._to_float(row.get('dev25', 0.0), 0.0)
         rs_21_val = AdvancedStrategyAnalyzer._to_float(row.get('rs_21', 0.0), 0.0)
+        vol_ratio = AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 1.0), 1.0)
+        
+        # --- 【改修】外部スコア(AI・財務・登場回数)をテクニカルからプロキシ算出 ---
+        surrogate_base = 50.0
+        
+        if attr == "押し目":
+            if dev25_val < 0: surrogate_base += 15.0
+            if rsi_val < 40.0: surrogate_base += 15.0
+            if rs_21_val > -5.0: surrogate_base += 10.0 
+            if vol_ratio > 1.2: surrogate_base += 10.0
+        else:
+            ma5 = AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0.0))
+            ma25 = AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0.0))
+            macd = AdvancedStrategyAnalyzer._to_float(row.get('macd', 0.0))
+            sig = AdvancedStrategyAnalyzer._to_float(row.get('sig', 0.0))
+            
+            if ma5 > 0 and ma25 > 0 and ma5 > ma25: surrogate_base += 15.0
+            if macd > sig: surrogate_base += 15.0
+            if rs_21_val > 0: surrogate_base += 10.0
+            if vol_ratio > 1.2: surrogate_base += 10.0
+        
+        # 優良銘柄前提として財務・登場回数のモック値を設定
+        mock_fin_score = 3.0
+        mock_appear_count = 3.0
         
         tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
-        total_score = (50 * 0.7) + (2 * 3) + (1 * 2) - tech_penalty 
         
+        # 本番環境と全く同じ計算式を適用
+        total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty 
+        # ----------------------------------------------------------------------
+        
+        # エントリー閾値は元コードのまま維持
         if attr == "押し目": return total_score >= 80
         return total_score >= 85 and rs_21_val > 0
 
@@ -98,7 +125,6 @@ class AdvancedStrategyAnalyzer:
     def calculate_limit_price(row: pd.Series, attr: str, n_chg: float) -> float:
         if not isinstance(row, pd.Series): raise TypeError("row must be pd.Series")
         
-        # 【改修】安全な型変換メソッドを使用
         curr_price = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 0.0))
         
@@ -174,7 +200,6 @@ class IntegratedBacktester:
 
         for i in range(len(self.df)):
             row = self.df.iloc[i]
-            # 【改修】すべて安全な型変換を使用
             curr_c = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
             curr_l = AdvancedStrategyAnalyzer._to_float(row.get('low', 0.0))
             curr_o = AdvancedStrategyAnalyzer._to_float(row.get('open', 0.0))
@@ -250,7 +275,14 @@ def run_integrity_tests() -> None:
     limit_p_gap = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", -1.0)
     assert limit_p_gap == 981.0, f"Hybrid limit price calculation failed. Expected 981.0, got {limit_p_gap}"
 
-    # 【検証】異常な文字列やNaNが混入してもクラッシュしないことの証明
+    # 【検証】プロキシ加算ロジックが安全に動作することの確認
+    dummy_row_proxy = pd.Series({'ma5': 105.0, 'ma25': 100.0, 'macd': 1.0, 'sig': 0.5, 'vol_ratio': 1.5, 'rs_21': 5.0})
+    try:
+        res = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_proxy, "スイング", 0.0, 15.0)
+        assert isinstance(res, bool), "evaluate_entry must return bool even with proxy logic"
+    except Exception as e:
+        raise AssertionError(f"Failed to handle proxy logic: {e}")
+
     dummy_row_err = pd.Series({'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None})
     try:
         res = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
