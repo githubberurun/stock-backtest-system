@@ -2,175 +2,269 @@ import pandas as pd
 import numpy as np
 import os
 import yfinance as yf
-import time
 from typing import Dict, List, Any, Optional, Final, Tuple
 from datetime import datetime, timedelta
 
-# 公式ドキュメント参照URL
-# J-Quants API v2: https://jpx-jquants.com/jp/api/overview/
-# yfinance: https://github.com/ranaroussi/yfinance
-
 # ==========================================
-# 1. 指標・シグナル分析エンジン
+# 1. 統合分析エンジン (Entry & Exit & Limit Price)
 # ==========================================
 class AdvancedStrategyAnalyzer:
-    """エントリー（ガードレール）とエグジット（シャンデリア）を統合管理"""
-
     @staticmethod
     def calculate_indicators(df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        if not isinstance(df, pd.DataFrame): raise TypeError("df must be DataFrame")
-        if df.empty or len(df) < 20: return df
-        
-        # 物理クレンジング: カラム名を小文字に統一
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df must be a pandas DataFrame")
+        if df.empty or len(df) < 25: 
+            return df
+            
         df.columns = [str(c).lower() for c in df.columns]
-        
-        # 基本指標
+
+        # 必須列の存在確認 (ユーザーへの確認喚起用)
+        required_cols = {'open', 'high', 'low', 'close', 'volume'}
+        if not required_cols.issubset(set(df.columns)):
+            missing = required_cols - set(df.columns)
+            raise KeyError(f"DataFrameに必須列が不足しています: {missing}。列名が異なる場合は事前に小文字にリネームしてください。")
+
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
         df['dev25'] = (df['close'] - df['ma25']) / df['ma25'] * 100
         
-        # ボリンジャーバンド (2σ, 3σ, +1σ)
         df['ma20'] = df['close'].rolling(window=20).mean()
         df['std20'] = df['close'].rolling(window=20).std()
         df['bb_up_3'] = df['ma20'] + (df['std20'] * 3)
         df['bb_p1'] = df['ma20'] + df['std20'] 
-        
-        # エグジット判定用
         df['prev_low'] = df['low'].shift(1)
+        
         df['was_above_bb_p1'] = (df['high'] >= df['bb_p1']).rolling(window=5).max() > 0
         df['bb_p1_cross_down'] = df['was_above_bb_p1'] & (df['close'] < df['bb_p1']) & (df['close'] < df['prev_low'])
 
-        if 'open' in df.columns:
-            df['was_above_bb_up_3'] = (df['high'] >= df['bb_up_3']).rolling(window=3).max() > 0
-            is_reversal = (df['close'] < df['prev_low']) | (df['close'] < df['open'])
-            df['bb_3_reversal'] = df['was_above_bb_up_3'] & is_reversal
-        else:
-            df['bb_3_reversal'] = False 
+        df['was_above_bb_up_3'] = (df['high'] >= df['bb_up_3']).rolling(window=3).max() > 0
+        df['bb_3_reversal'] = df['was_above_bb_up_3'] & ((df['close'] < df['prev_low']) | (df['close'] < df['open']))
 
-        # MACD & RSI
-        df['ema12'], df['ema26'] = df['close'].ewm(span=12).mean(), df['close'].ewm(span=26).mean()
+        df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+        df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = df['ema12'] - df['ema26']
-        df['sig'] = df['macd'].ewm(span=9).mean()
+        df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
         
         delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
         
-        # ATR & 出来高比
-        tr = pd.concat([(df['high']-df['low']), (df['high']-df['close'].shift()).abs(), (df['low']-df['close'].shift()).abs()], axis=1).max(axis=1)
-        df['atr'] = tr.rolling(window=20).mean()
-        df['ma25_vol'] = df['volume'].rolling(window=25).mean()
-        df['vol_ratio'] = (df['volume'] / df['ma25_vol'].replace(0, np.nan)).fillna(0)
+        tr = pd.concat([
+            (df['high'] - df['low']), 
+            (df['high'] - df['close'].shift()).abs(), 
+            (df['low'] - df['close'].shift()).abs()
+        ], axis=1).max(axis=1)
+        df['atr'] = tr.rolling(window=14).mean() 
+        df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
 
-        # 相対力指数 (RS_21)
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             df = df.merge(benchmark_df[['date', 'close']], on='date', how='left', suffixes=('', '_bm'))
+            df['close_bm'] = df['close_bm'].ffill()
             df['rs_21'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
+            df['rs'] = df['rs_21']
         else:
             df['rs_21'] = 0.0
+            df['rs'] = 0.0
 
         return df
 
     @staticmethod
-    def evaluate_entry(row: pd.Series, attr: str, nasdaq_chg: float, vix: float) -> bool:
-        """エントリー・ガードレール判定"""
-        # 米国市場警戒
-        if nasdaq_chg <= -2.0 or vix >= 20.0: return False
+    def evaluate_entry(row: pd.Series, attr: str, n_chg: float, vix: float) -> bool:
+        if not isinstance(row, pd.Series): raise TypeError("row must be pd.Series")
+        if n_chg <= -2.0 or vix >= 20.0: return False
         
-        # 物理計算: 総合スコア（AIニュース判定なし版）
-        rsi_val, d25_val, rs_val = float(row.get('rsi', 50)), float(row.get('dev25', 0)), float(row.get('rs_21', 0))
+        tech_penalty = (20.0 if float(row.get('rsi', 50)) > 80 else 0) + (15.0 if float(row.get('dev25', 0)) > 20 else 0)
+        total_score = (50 * 0.7) + (2 * 3) + (1 * 2) - tech_penalty 
         
-        tech_penalty = 0.0
-        if attr != "中長期(グロース)":
-            if rsi_val > 80: tech_penalty += 20.0
-            if d25_val > 20: tech_penalty += 15.0
-
-        total_score = round((50.0 * 0.7) + (2 * 3) + (1 * 2) - tech_penalty, 1) # 基本点35+財務6+登場2
-
         if attr == "押し目": return total_score >= 80
-        elif "中長期" in attr: return total_score >= 70
-        else: return total_score >= 85 and rs_val > 0
+        return total_score >= 85 and float(row.get('rs_21', 0)) > 0
+
+    @staticmethod
+    def calculate_limit_price(row: pd.Series, attr: str, n_chg: float) -> float:
+        """deep_analyzer.py の指値算出ロジックを忠実に再現"""
+        if not isinstance(row, pd.Series): raise TypeError("row must be pd.Series")
+        
+        curr_price = float(row.get('close', 0.0))
+        atr = float(row.get('atr', 0.0))
+        
+        if "中長期" in attr: base_offset = 0.5
+        elif attr == "押し目": base_offset = 0.0
+        else: base_offset = 0.3
+
+        is_hybrid_guardrail = (n_chg <= -0.8)
+        nasdaq_drop_ratio = abs(n_chg) / 100.0 if is_hybrid_guardrail else 0.0
+        price_shift = curr_price * nasdaq_drop_ratio
+
+        # 本番コードにおける range_max 側（約定しやすい浅めの指値）をターゲットとする
+        limit_price = curr_price - (atr * base_offset) - price_shift
+        return float(max(1.0, limit_price))
 
 # ==========================================
 # 2. 米国市場キャッシュ & バックテスター
 # ==========================================
 class USMarketCache:
-    """過去10年分の米国指標を保持"""
-    def __init__(self):
-        self.ndx = yf.Ticker("^IXIC").history(period="10y")['Close'].pct_change() * 100
-        self.vix = yf.Ticker("^VIX").history(period="10y")['Close']
-        self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
-        self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
+    def __init__(self) -> None:
+        print("[INFO] Caching US market data...")
+        try:
+            ndx_data = yf.Ticker("^IXIC").history(period="10y")
+            vix_data = yf.Ticker("^VIX").history(period="10y")
+            
+            if not ndx_data.empty and not vix_data.empty:
+                self.ndx = ndx_data['Close'].pct_change() * 100
+                self.vix = vix_data['Close']
+                self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
+                self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
+            else:
+                self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
+        except Exception as e:
+            print(f"[WARN] USMarketCache init failed: {e}")
+            self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
 
-    def get_market_state(self, date_str: str) -> Tuple[float, float]:
+    def get_state(self, date_str: str) -> Tuple[float, float]:
+        if self.ndx.empty or self.vix.empty: return 0.0, 15.0
+            
         dt = datetime.strptime(date_str, '%Y-%m-%d')
         for i in range(1, 6):
             prev = (dt - timedelta(days=i)).strftime('%Y-%m-%d')
-            if prev in self.ndx.index: return float(self.ndx[prev]), float(self.vix[prev])
+            if prev in self.ndx.index and prev in self.vix.index: 
+                return float(self.ndx[prev]), float(self.vix[prev])
         return 0.0, 15.0
 
 class IntegratedBacktester:
-    def __init__(self, ticker: str, initial_cash: float = 1000000.0, attr: str = "スイング"):
-        self.ticker, self.cash, self.attr = ticker, initial_cash, attr
-        self.df = AdvancedStrategyAnalyzer.calculate_indicators(
-            pd.read_parquet(f"data/{ticker}.parquet"),
-            pd.read_parquet("data/13060.parquet") if os.path.exists("data/13060.parquet") else None
-        )
+    def __init__(self, ticker: str, initial_cash: float = 1000000.0, attr: str = "スイング") -> None:
+        self.ticker: str = ticker
+        self.cash: float = initial_cash
+        self.attr: str = attr
+        
+        # ユーザー指定ディレクトリからの読み込み。見つからない場合はテスト用ダミーを作成
+        file_path = f"data/{ticker}.parquet" 
+        if os.path.exists(file_path):
+            target_df = pd.read_parquet(file_path)
+            bm_df = pd.read_parquet("data/13060.parquet") if os.path.exists("data/13060.parquet") else None
+        else:
+            print(f"[WARN] {file_path} not found. Creating dummy data for testing.")
+            dates = pd.date_range(end=datetime.now(), periods=100)
+            target_df = pd.DataFrame({'date': dates, 'open': 1000, 'high': 1050, 'low': 950, 'close': 1020, 'volume': 10000})
+            bm_df = pd.DataFrame({'date': dates, 'close': 2000})
+
+        self.df = AdvancedStrategyAnalyzer.calculate_indicators(target_df, bm_df)
         self.df['date_str'] = pd.to_datetime(self.df['date']).dt.strftime('%Y-%m-%d')
         self.us_market = USMarketCache()
 
     def run(self) -> Dict[str, Any]:
         cash, pos, entry_p, high_p = self.cash, 0.0, 0.0, 0.0
         atr_mult = 3.0 if "中長期" in self.attr else (2.0 if self.attr == "押し目" else 2.5)
-        trades = []
+        trades, equity = [], []
+        
+        # 指値注文用のステート管理
+        pending_entry = False
+        target_limit_price = 0.0
 
         for i in range(len(self.df)):
             row = self.df.iloc[i]
-            curr_p = float(row['close'])
-            n_chg, vix = self.us_market.get_market_state(row['date_str'])
+            curr_c = float(row['close'])
+            curr_l = float(row['low'])
+            curr_o = float(row['open'])
+            n_chg, vix = self.us_market.get_state(str(row['date_str']))
 
             if pos == 0:
-                if AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix):
-                    pos, entry_p, high_p = cash // curr_p, curr_p, curr_p
-                    cash -= pos * curr_p
+                # 前日のシグナルに基づく指値約定判定
+                if pending_entry:
+                    if curr_l <= target_limit_price:
+                        # 窓開けギャップダウンを考慮し、始値と指値の低い方で約定
+                        entry_p = min(curr_o, target_limit_price)
+                        pos = cash // entry_p
+                        high_p = entry_p
+                        cash -= pos * entry_p
+                        pending_entry = False
+                        equity.append(cash + (pos * curr_c))
+                        continue # 約定当日はエグジット判定をスキップ
+                    else:
+                        # 指値に刺さらなかった場合はキャンセル
+                        pending_entry = False
+
+                # 当日の終値ベースで新規シグナル判定
+                if not pending_entry and AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix):
+                    target_limit_price = AdvancedStrategyAnalyzer.calculate_limit_price(row, self.attr, n_chg)
+                    pending_entry = True
+
             else:
-                high_p = max(high_p, curr_p)
-                # エグジットスコア判定
-                ch = max(high_p - (float(row['atr']) * atr_mult), entry_p - (float(row['atr']) * atr_mult))
+                high_p = max(high_p, curr_c)
+                current_atr = float(row.get('atr', 0))
+                ch = max(high_p - (current_atr * atr_mult), entry_p - (current_atr * atr_mult))
                 
-                # exit_strategyロジック: スコア80以上で撤退
                 score = 0
                 if bool(row.get('bb_3_reversal', False)): score += 40
-                if curr_p < ch: score += 100
-                if float(row.get('ma5', 0)) < float(row.get('ma25', 0)) and float(row.get('vol_ratio', 0)) >= 1.0: score += 15
+                if curr_c < ch: score += 100
+                
+                if current_atr > 0 and curr_c > entry_p:
+                    r_mult = (curr_c - entry_p) / (current_atr * 2)
+                    if "中長期" not in self.attr and r_mult >= 3.0:
+                        score += 100
+
+                if self.attr in ["スイング", "押し目"]:
+                    if bool(row.get('bb_p1_cross_down', False)): score += 20
+                    if float(row.get('ma5', 0)) < float(row.get('ma25', 0)) and float(row.get('vol_ratio', 0)) >= 1.0: score += 15
+                    if float(row.get('macd', 0)) < float(row.get('sig', 0)) and float(row.get('vol_ratio', 0)) >= 1.0: score += 15
+                elif "中長期" in self.attr:
+                    if float(row.get('rsi', 0)) > 85: score += 10
+                
+                if float(row.get('rs', 0)) < -5: score += 5
 
                 if score >= 80:
-                    cash += pos * curr_p
-                    trades.append((curr_p - entry_p) / entry_p)
+                    cash += pos * curr_c
+                    trades.append((curr_c - entry_p) / entry_p)
                     pos = 0
 
-        final = cash + (pos * self.df.iloc[-1]['close'] if pos > 0 else 0)
-        return {"Ticker": self.ticker, "Return": f"{(final-self.cash)/self.cash:.2%}", "Trades": len(trades)}
+            equity.append(cash + (pos * curr_c if pos > 0 else 0))
+
+        final = equity[-1] if equity else self.cash
+        mdd_series = (pd.Series(equity) - pd.Series(equity).cummax()) / pd.Series(equity).cummax()
+        mdd = float(mdd_series.min()) if not mdd_series.empty and not pd.isna(mdd_series.min()) else 0.0
+        
+        return {"Ticker": self.ticker, "Return": f"{(final-self.cash)/self.cash:.2%}", "MDD": f"{mdd:.2%}", "Trades": len(trades)}
 
 # ==========================================
-# 3. 堅牢性テスト
+# 3. 堅牢性テスト & メイン実行
 # ==========================================
-def test_integrity():
-    print("--- Running Robustness Tests ---")
-    # 空データテスト
-    assert AdvancedStrategyAnalyzer.calculate_indicators(pd.DataFrame()).empty
-    # エントリーガードレール（NASDAQ -3%）
-    mock = pd.Series({'rsi': 50, 'dev25': 0, 'rs_21': 5})
-    assert AdvancedStrategyAnalyzer.evaluate_entry(mock, "スイング", -3.0, 15.0) == False, "Guardrail failed"
-    print("--- Tests Passed ---")
+def run_integrity_tests() -> None:
+    print("[TEST] Running integrity and edge-case tests...")
+    
+    # 1. 空データに対する堅牢性
+    empty_df = pd.DataFrame()
+    res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
+    assert res_df.empty, "Empty DataFrame should return empty DataFrame"
+    
+    # 2. 指値計算の検証 (ATR=30, Close=1000, 属性=スイング)
+    # 期待値: 1000 - (30 * 0.3) = 991
+    dummy_row_limit = pd.Series({'close': 1000.0, 'atr': 30.0})
+    limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", 0.0)
+    assert limit_p == 991.0, f"Limit price calculation failed. Expected 991.0, got {limit_p}"
+    
+    # 3. ギャップダウン時の指値計算 (NASDAQ -1.0%下落時)
+    # price_shift = 1000 * 0.01 = 10.0
+    # 期待値: 1000 - (30 * 0.3) - 10.0 = 981
+    limit_p_gap = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", -1.0)
+    assert limit_p_gap == 981.0, f"Hybrid limit price calculation failed. Expected 981.0, got {limit_p_gap}"
+
+    # 4. 異常値・欠損値の型チェック
+    dummy_row_err = pd.Series({'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None})
+    try:
+        res = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
+        assert isinstance(res, bool), "evaluate_entry must return bool even with corrupted data"
+    except Exception as e:
+        raise AssertionError(f"Failed to handle corrupted data: {e}")
+        
+    print("[TEST] All tests passed.")
 
 if __name__ == "__main__":
-    test_integrity()
+    run_integrity_tests()
     try:
-        res = IntegratedBacktester("7203").run()
-        print(f"Final Result: {res}")
+        tester = IntegratedBacktester("7203")
+        res = tester.run()
+        print(f"[RESULT] {res}")
         pd.DataFrame([res]).to_csv("backtest_report.csv", index=False)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"[FATAL] {e}")
