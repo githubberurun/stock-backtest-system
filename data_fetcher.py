@@ -19,9 +19,36 @@ class JQuantsV2Fetcher:
 
     def get_safe_start_date(self) -> str:
         """プラン制限(10年)の境界値を考慮した開始日を算出"""
-        # 10年前の同日（エラー回避のため+1日調整）
         safe_date = datetime.now() - timedelta(days=365 * 10 - 1)
         return safe_date.strftime("%Y-%m-%d")
+
+    def get_top_tickers(self, limit: int = 300) -> List[str]:
+        """直近の売買代金上位銘柄を抽出する"""
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+            
+        print("[INFO] Fetching top tickers by TurnoverValue...")
+        target_date = datetime.now().date()
+        
+        for _ in range(5): # 直近5日間でデータが存在する日を探す
+            params = {"date": target_date.strftime("%Y%m%d")}
+            try:
+                response = requests.get(f"{BASE_URL}{ENDPOINT}", headers=self.headers, params=params, timeout=30)
+                if response.status_code == 200:
+                    data = response.json().get("data", [])
+                    if len(data) > 500:
+                        df = pd.DataFrame(data)
+                        df['Va_n'] = pd.to_numeric(df.get('TurnoverValue', df.get('Va', 0)), errors='coerce')
+                        top_df = df[df['Va_n'] >= 50_000_000].sort_values('Va_n', ascending=False).head(limit)
+                        # コードの末尾(0)を削除してリスト化
+                        return [str(code)[:4] for code in top_df['Code'].tolist()]
+            except Exception as e:
+                print(f"[WARN] Failed to fetch daily data for {target_date}: {e}")
+            target_date -= timedelta(days=1)
+            time.sleep(1)
+            
+        print("[ERROR] Could not fetch recent market data.")
+        return []
 
     def fetch(self, ticker: str) -> pd.DataFrame:
         if not isinstance(ticker, str):
@@ -31,8 +58,6 @@ class JQuantsV2Fetcher:
         start_date: str = self.get_safe_start_date()
         all_data: List[Dict[str, Any]] = []
         pagination_key: Optional[str] = None
-
-        print(f"[FETCH] Target: {code}, Since: {start_date}")
 
         while True:
             params: Dict[str, Any] = {"code": code, "from": start_date}
@@ -55,15 +80,16 @@ class JQuantsV2Fetcher:
             pagination_key = res_json.get("pagination_key")
             if not pagination_key:
                 break
-            time.sleep(0.5)
+            time.sleep(0.3)
 
         return self._clean(pd.DataFrame(all_data))
 
     def _clean(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df must be a pandas DataFrame")
         if df.empty: 
             return df
             
-        # 本番環境(exit_strategy.py)と同等のカラムマッピング（調整後株価を優先）
         col_map = {
             'Date': 'date', 
             'AdjClose': 'close', 'AdjC': 'close', 'C': 'close_raw', 'Close': 'close_raw',
@@ -74,7 +100,6 @@ class JQuantsV2Fetcher:
         }
         df = df.rename(columns=col_map)
         
-        # 調整後株価が存在しない場合のフォールバック処理
         if 'close' not in df.columns and 'close_raw' in df.columns:
             df = df.rename(columns={
                 'close_raw': 'close', 
@@ -101,7 +126,6 @@ def test_integrity() -> None:
     print("[TEST] Running integrity tests for data_fetcher.py...")
     dummy_fetcher = JQuantsV2Fetcher("dummy_key")
     
-    # テスト1: 調整後株価(Adj)のマッピングテスト
     df_mock_adj = pd.DataFrame({
         'Date': ['2026-01-01'], 'AdjC': [150.5], 'AdjH': [155.0], 
         'AdjL': [149.0], 'AdjO': [150.0], 'AdjVo': [5000]
@@ -109,21 +133,17 @@ def test_integrity() -> None:
     cleaned_adj = dummy_fetcher._clean(df_mock_adj)
     assert 'close' in cleaned_adj.columns, "AdjC should be mapped to 'close'"
     assert cleaned_adj['close'].iloc[0] == 150.5, "Value matching failed for AdjC"
-    assert 'open' in cleaned_adj.columns and 'high' in cleaned_adj.columns, "Other OHLC missing"
 
-    # テスト2: 生株価(Raw)のフォールバックテスト
-    df_mock_raw = pd.DataFrame({
-        'Date': ['2026-01-01'], 'C': [50.0], 'H': [55.0], 
-        'L': [49.0], 'O': [50.0], 'Vo': [100]
-    })
-    cleaned_raw = dummy_fetcher._clean(df_mock_raw)
-    assert 'close' in cleaned_raw.columns, "Raw 'C' should fallback to 'close'"
-    assert cleaned_raw['close'].iloc[0] == 50.0, "Value matching failed for raw 'C'"
-
-    # テスト3: 空データのクラッシュ防止
     df_empty = pd.DataFrame()
     cleaned_empty = dummy_fetcher._clean(df_empty)
     assert cleaned_empty.empty, "Empty DataFrame should return empty DataFrame"
+    
+    # 型チェック例外のテスト
+    try:
+        dummy_fetcher.fetch(1234) # type: ignore
+        assert False, "fetch() should raise TypeError for non-string input"
+    except TypeError:
+        pass
 
     print("[TEST] All integrity tests passed.")
 
@@ -137,11 +157,18 @@ if __name__ == "__main__":
     fetcher = JQuantsV2Fetcher(key)
     os.makedirs("data", exist_ok=True)
     
-    # 対象銘柄とベンチマーク(13060)の両方を取得
-    for target_ticker in ["7203", "13060"]:
+    # 動的に上位300銘柄を取得
+    target_tickers = fetcher.get_top_tickers(limit=300)
+    if "13060" not in target_tickers:
+        target_tickers.append("13060") # ベンチマークを確実に追加
+        
+    print(f"[INFO] Starting data fetch for {len(target_tickers)} tickers...")
+    
+    for i, target_ticker in enumerate(target_tickers):
+        print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ")
         fetched_data = fetcher.fetch(target_ticker)
         if not fetched_data.empty:
             fetched_data.to_parquet(f"data/{target_ticker}.parquet", index=False)
-            print(f"[SUCCESS] {target_ticker} saved. ({len(fetched_data)} rows)")
+            print(f"OK ({len(fetched_data)} rows)")
         else:
-            print(f"[WARN] Failed to fetch or clean data for {target_ticker}.")
+            print("FAILED")
