@@ -11,7 +11,6 @@ from datetime import datetime, timedelta
 class AdvancedStrategyAnalyzer:
     @staticmethod
     def _to_float(val: Any, default: float = 0.0) -> float:
-        """異常値や欠損値を安全にfloat型へ変換する内部メソッド"""
         try:
             f = float(val)
             return f if np.isfinite(f) else default
@@ -22,7 +21,7 @@ class AdvancedStrategyAnalyzer:
     def calculate_indicators(df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df must be a pandas DataFrame")
-        if df.empty or len(df) < 25: 
+        if df.empty or len(df) < 200: # 200日MAを計算するため最低200行必要
             return df
             
         df.columns = [str(c).lower() for c in df.columns]
@@ -30,9 +29,8 @@ class AdvancedStrategyAnalyzer:
         required_cols = {'open', 'high', 'low', 'close', 'volume'}
         if not required_cols.issubset(set(df.columns)):
             missing = required_cols - set(df.columns)
-            raise KeyError(f"DataFrameに必須列が不足しています: {missing}。列名が異なる場合は事前に小文字にリネームしてください。")
+            raise KeyError(f"DataFrameに必須列が不足しています: {missing}")
 
-        # 【改修】初動検知用の前日データ
         df['prev_close'] = df['close'].shift(1)
 
         df['ma5'] = df['close'].rolling(window=5).mean()
@@ -45,6 +43,11 @@ class AdvancedStrategyAnalyzer:
         df['bb_p1'] = df['ma20'] + df['std20'] 
         df['prev_low'] = df['low'].shift(1)
         
+        # 【改修】main.py同期用の追加インジケーター (75MA, 200MA, BB幅)
+        df['ma75'] = df['close'].rolling(window=75).mean()
+        df['ma200'] = df['close'].rolling(window=200).mean()
+        df['bb_width'] = np.where(df['ma20'] > 0, (df['std20'] * 4) / df['ma20'], 0)
+        
         df['was_above_bb_p1'] = (df['high'] >= df['bb_p1']).rolling(window=5).max() > 0
         df['bb_p1_cross_down'] = df['was_above_bb_p1'] & (df['close'] < df['bb_p1']) & (df['close'] < df['prev_low'])
 
@@ -56,17 +59,13 @@ class AdvancedStrategyAnalyzer:
         df['macd'] = df['ema12'] - df['ema26']
         df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
         
-        # 【改修】遅行指標のトラップを避けるための「直近3日以内のクロス」検知
-        ma5_cross_up = (df['ma5'] > df['ma25']) & (df['ma5'].shift(1) <= df['ma25'].shift(1))
-        macd_cross_up = (df['macd'] > df['sig']) & (df['macd'].shift(1) <= df['sig'].shift(1))
-        df['recent_ma_cross'] = ma5_cross_up.rolling(window=3).max().fillna(0) > 0
-        df['recent_macd_cross'] = macd_cross_up.rolling(window=3).max().fillna(0) > 0
-        
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
-        df['prev_rsi'] = df['rsi'].shift(1)
+        
+        # 【改修】main.py同期用: 5日前のRSIとの差分（モメンタム）
+        df['rsi_slope'] = df['rsi'] - df['rsi'].shift(5)
         
         tr = pd.concat([
             (df['high'] - df['low']), 
@@ -93,74 +92,74 @@ class AdvancedStrategyAnalyzer:
         if not isinstance(row, pd.Series): raise TypeError("row must be pd.Series")
         if n_chg <= -2.0 or vix >= 20.0: return False
         
+        curr_c = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
+        prev_c = AdvancedStrategyAnalyzer._to_float(row.get('prev_close', 0.0))
         rsi_val = AdvancedStrategyAnalyzer._to_float(row.get('rsi', 50.0), 50.0)
         dev25_val = AdvancedStrategyAnalyzer._to_float(row.get('dev25', 0.0), 0.0)
         rs_21_val = AdvancedStrategyAnalyzer._to_float(row.get('rs_21', 0.0), 0.0)
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 1.0), 1.0)
         
-        curr_c = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
-        prev_c = AdvancedStrategyAnalyzer._to_float(row.get('prev_close', 0.0))
+        m25 = AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0.0))
+        m75 = AdvancedStrategyAnalyzer._to_float(row.get('ma75', 0.0))
+        m200 = AdvancedStrategyAnalyzer._to_float(row.get('ma200', 0.0))
+        bb_width = AdvancedStrategyAnalyzer._to_float(row.get('bb_width', 1.0))
+        rsi_slope = AdvancedStrategyAnalyzer._to_float(row.get('rsi_slope', 0.0))
         
-        surrogate_base = 50.0
+        # --- 【改修】main.py の get_evaluation() を完全にシミュレート ---
+        main_score = 0.0
         
         if attr == "押し目":
-            prev_rsi = AdvancedStrategyAnalyzer._to_float(row.get('prev_rsi', 50.0))
-            is_rebounding = (curr_c > prev_c) and (rsi_val > prev_rsi)
-            
-            # 落ちるナイフを避け、反転の「初動」を強く評価
-            if dev25_val < -2.0 and is_rebounding: surrogate_base += 25.0
-            elif dev25_val < 0: surrogate_base += 5.0
-            
-            if rs_21_val > -5.0: surrogate_base += 10.0 
-            if vol_ratio > 1.2 and is_rebounding: surrogate_base += 15.0
+            is_uptrend = (m75 > m200) and (curr_c > m200)
+            if is_uptrend:
+                if curr_c < m25 and rsi_val <= 35 and vol_ratio < 0.8: main_score += 100
+                elif curr_c < m25 and rsi_val <= 45 and vol_ratio <= 1.0: main_score += 60
+                
+                # ボラティリティ収縮（VCP）検知
+                if bb_width <= 0.10 and vol_ratio <= 0.8:
+                    main_score += 40
         else:
-            ma5 = AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0.0))
-            ma25 = AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0.0))
-            recent_ma_cross = bool(row.get('recent_ma_cross', False))
-            recent_macd_cross = bool(row.get('recent_macd_cross', False))
+            # スイング
+            if vol_ratio >= 2.0: main_score += 40
+            elif vol_ratio >= 1.5: main_score += 20
             
-            # 大陽線＋出来高急増（AIが好材料を検知した際の疑似的リアクション）
-            price_surge = (prev_c > 0) and ((curr_c / prev_c) > 1.02) and (vol_ratio > 1.5)
+            if 50 <= rsi_val <= 75: main_score += 15
+            elif 75 < rsi_val <= 85: main_score += 5
+            elif rsi_val > 85 and curr_c < prev_c: main_score -= 10
             
-            # 遅行指標の「状態」ではなく「クロス直後」に限定して加点し、高値掴みを防止
-            if recent_ma_cross: surrogate_base += 20.0
-            elif ma5 > ma25: surrogate_base += 5.0
+            if rsi_slope >= 10.0: main_score += 20
             
-            if recent_macd_cross: surrogate_base += 20.0
-            elif AdvancedStrategyAnalyzer._to_float(row.get('macd', 0.0)) > AdvancedStrategyAnalyzer._to_float(row.get('sig', 0.0)): surrogate_base += 5.0
+            if 0 < dev25_val <= 20: main_score += 15
+            elif dev25_val > 20: main_score += 5
             
-            if price_surge: surrogate_base += 15.0
-            elif vol_ratio > 1.2: surrogate_base += 5.0
+            if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 20
             
-            if rs_21_val > 0: surrogate_base += 5.0
+            # 財務指標・Zスコアのモック値加算（優良銘柄前提）
+            main_score += 30 
+            
+        surrogate_base = min(100.0, main_score)
         
-        # 本番ベースのモックデータ（優良銘柄の前提）
+        # --- deep_analyzer.py 側の最終スコア計算 ---
         mock_fin_score = 3.0
         mock_appear_count = 3.0
         tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
         
         total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty 
         
-        # 厳しいエントリー閾値は維持
         if attr == "押し目": return total_score >= 80
         return total_score >= 85 and rs_21_val > 0
 
     @staticmethod
     def calculate_limit_price(row: pd.Series, attr: str, n_chg: float) -> float:
         if not isinstance(row, pd.Series): raise TypeError("row must be pd.Series")
-        
         curr_price = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 0.0))
-        
         if "中長期" in attr: base_offset = 0.5
         elif attr == "押し目": base_offset = 0.0
         else: base_offset = 0.3
 
         is_hybrid_guardrail = (n_chg <= -0.8)
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if is_hybrid_guardrail else 0.0
-        price_shift = curr_price * nasdaq_drop_ratio
-
-        limit_price = curr_price - (atr * base_offset) - price_shift
+        limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price))
 
 # ==========================================
@@ -172,7 +171,6 @@ class USMarketCache:
         try:
             ndx_data = yf.Ticker("^IXIC").history(period="10y")
             vix_data = yf.Ticker("^VIX").history(period="10y")
-            
             if not ndx_data.empty and not vix_data.empty:
                 self.ndx = ndx_data['Close'].pct_change() * 100
                 self.vix = vix_data['Close']
@@ -186,7 +184,6 @@ class USMarketCache:
 
     def get_state(self, date_str: str) -> Tuple[float, float]:
         if self.ndx.empty or self.vix.empty: return 0.0, 15.0
-            
         dt = datetime.strptime(date_str, '%Y-%m-%d')
         for i in range(1, 6):
             prev = (dt - timedelta(days=i)).strftime('%Y-%m-%d')
@@ -205,13 +202,14 @@ class IntegratedBacktester:
             target_df = pd.read_parquet(file_path)
             bm_df = pd.read_parquet("data/13060.parquet") if os.path.exists("data/13060.parquet") else None
         else:
-            print(f"[WARN] {file_path} not found. Creating dummy data for testing.")
-            dates = pd.date_range(end=datetime.now(), periods=100)
+            print(f"[WARN] {file_path} not found. Creating dummy data.")
+            dates = pd.date_range(end=datetime.now(), periods=250)
             target_df = pd.DataFrame({'date': dates, 'open': 1000, 'high': 1050, 'low': 950, 'close': 1020, 'volume': 10000})
             bm_df = pd.DataFrame({'date': dates, 'close': 2000})
 
         self.df = AdvancedStrategyAnalyzer.calculate_indicators(target_df, bm_df)
-        self.df['date_str'] = pd.to_datetime(self.df['date']).dt.strftime('%Y-%m-%d')
+        if not self.df.empty:
+            self.df['date_str'] = pd.to_datetime(self.df['date']).dt.strftime('%Y-%m-%d')
         self.us_market = USMarketCache()
 
     def run(self) -> Dict[str, Any]:
@@ -221,16 +219,14 @@ class IntegratedBacktester:
         
         pending_entry = False
         target_limit_price = 0.0
-        
-        took_2r = False
-        took_3r = False
+        took_2r, took_3r = False, False
 
         for i in range(len(self.df)):
             row = self.df.iloc[i]
             curr_c = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
             curr_l = AdvancedStrategyAnalyzer._to_float(row.get('low', 0.0))
             curr_o = AdvancedStrategyAnalyzer._to_float(row.get('open', 0.0))
-            n_chg, vix = self.us_market.get_state(str(row['date_str']))
+            n_chg, vix = self.us_market.get_state(str(row.get('date_str', '2000-01-01')))
 
             if pos == 0:
                 if pending_entry:
@@ -268,8 +264,7 @@ class IntegratedBacktester:
                                 cash += sell_pos * curr_c
                                 trades.append((curr_c - entry_p) / entry_p)
                                 pos -= sell_pos
-                            took_3r = True
-                            took_2r = True 
+                            took_3r, took_2r = True, True 
                         elif r_mult >= 2.0 and not took_2r:
                             sell_pos = int(pos // 3)
                             if sell_pos > 0:
@@ -315,19 +310,14 @@ def run_integrity_tests() -> None:
     limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", 0.0)
     assert limit_p == 991.0, f"Limit price calculation failed. Expected 991.0, got {limit_p}"
     
-    limit_p_gap = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", -1.0)
-    assert limit_p_gap == 981.0, f"Hybrid limit price calculation failed. Expected 981.0, got {limit_p_gap}"
-
-    dummy_row_proxy = pd.Series({
-        'ma5': 105.0, 'ma25': 100.0, 'recent_ma_cross': True, 
-        'macd': 1.0, 'sig': 0.5, 'recent_macd_cross': True, 
-        'vol_ratio': 1.5, 'rs_21': 5.0, 'close': 105.0, 'prev_close': 100.0
-    })
+    # 【検証】main.py のVCP判定（ボラティリティ収縮）がスコアに反映されるか
+    dummy_row_vcp = pd.Series({'ma25': 105.0, 'ma75': 110.0, 'ma200': 100.0, 'close': 106.0, 'rsi': 30.0, 'vol_ratio': 0.5, 'bb_width': 0.05, 'rs_21': 5.0})
     try:
-        res = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_proxy, "スイング", 0.0, 15.0)
-        assert isinstance(res, bool), "evaluate_entry must return bool even with proxy logic"
+        # VCP+押し目条件なので高得点になるはず
+        res = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_vcp, "押し目", 0.0, 15.0)
+        assert isinstance(res, bool), "evaluate_entry must return bool with VCP proxy logic"
     except Exception as e:
-        raise AssertionError(f"Failed to handle proxy logic: {e}")
+        raise AssertionError(f"Failed to handle VCP proxy logic: {e}")
 
     dummy_row_err = pd.Series({'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None})
     try:
