@@ -10,6 +10,15 @@ from datetime import datetime, timedelta
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
+    def _to_float(val: Any, default: float = 0.0) -> float:
+        """異常値や欠損値を安全にfloat型へ変換する内部メソッド"""
+        try:
+            f = float(val)
+            return f if np.isfinite(f) else default
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
     def calculate_indicators(df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df must be a pandas DataFrame")
@@ -18,7 +27,6 @@ class AdvancedStrategyAnalyzer:
             
         df.columns = [str(c).lower() for c in df.columns]
 
-        # 必須列の存在確認 (ユーザーへの確認喚起用)
         required_cols = {'open', 'high', 'low', 'close', 'volume'}
         if not required_cols.issubset(set(df.columns)):
             missing = required_cols - set(df.columns)
@@ -75,19 +83,24 @@ class AdvancedStrategyAnalyzer:
         if not isinstance(row, pd.Series): raise TypeError("row must be pd.Series")
         if n_chg <= -2.0 or vix >= 20.0: return False
         
-        tech_penalty = (20.0 if float(row.get('rsi', 50)) > 80 else 0) + (15.0 if float(row.get('dev25', 0)) > 20 else 0)
+        # 【改修】安全な型変換メソッドを使用して値を取得
+        rsi_val = AdvancedStrategyAnalyzer._to_float(row.get('rsi', 50.0), 50.0)
+        dev25_val = AdvancedStrategyAnalyzer._to_float(row.get('dev25', 0.0), 0.0)
+        rs_21_val = AdvancedStrategyAnalyzer._to_float(row.get('rs_21', 0.0), 0.0)
+        
+        tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
         total_score = (50 * 0.7) + (2 * 3) + (1 * 2) - tech_penalty 
         
         if attr == "押し目": return total_score >= 80
-        return total_score >= 85 and float(row.get('rs_21', 0)) > 0
+        return total_score >= 85 and rs_21_val > 0
 
     @staticmethod
     def calculate_limit_price(row: pd.Series, attr: str, n_chg: float) -> float:
-        """deep_analyzer.py の指値算出ロジックを忠実に再現"""
         if not isinstance(row, pd.Series): raise TypeError("row must be pd.Series")
         
-        curr_price = float(row.get('close', 0.0))
-        atr = float(row.get('atr', 0.0))
+        # 【改修】安全な型変換メソッドを使用
+        curr_price = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
+        atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 0.0))
         
         if "中長期" in attr: base_offset = 0.5
         elif attr == "押し目": base_offset = 0.0
@@ -97,7 +110,6 @@ class AdvancedStrategyAnalyzer:
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if is_hybrid_guardrail else 0.0
         price_shift = curr_price * nasdaq_drop_ratio
 
-        # 本番コードにおける range_max 側（約定しやすい浅めの指値）をターゲットとする
         limit_price = curr_price - (atr * base_offset) - price_shift
         return float(max(1.0, limit_price))
 
@@ -138,7 +150,6 @@ class IntegratedBacktester:
         self.cash: float = initial_cash
         self.attr: str = attr
         
-        # ユーザー指定ディレクトリからの読み込み。見つからない場合はテスト用ダミーを作成
         file_path = f"data/{ticker}.parquet" 
         if os.path.exists(file_path):
             target_df = pd.read_parquet(file_path)
@@ -158,41 +169,37 @@ class IntegratedBacktester:
         atr_mult = 3.0 if "中長期" in self.attr else (2.0 if self.attr == "押し目" else 2.5)
         trades, equity = [], []
         
-        # 指値注文用のステート管理
         pending_entry = False
         target_limit_price = 0.0
 
         for i in range(len(self.df)):
             row = self.df.iloc[i]
-            curr_c = float(row['close'])
-            curr_l = float(row['low'])
-            curr_o = float(row['open'])
+            # 【改修】すべて安全な型変換を使用
+            curr_c = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
+            curr_l = AdvancedStrategyAnalyzer._to_float(row.get('low', 0.0))
+            curr_o = AdvancedStrategyAnalyzer._to_float(row.get('open', 0.0))
             n_chg, vix = self.us_market.get_state(str(row['date_str']))
 
             if pos == 0:
-                # 前日のシグナルに基づく指値約定判定
                 if pending_entry:
                     if curr_l <= target_limit_price:
-                        # 窓開けギャップダウンを考慮し、始値と指値の低い方で約定
                         entry_p = min(curr_o, target_limit_price)
                         pos = cash // entry_p
                         high_p = entry_p
                         cash -= pos * entry_p
                         pending_entry = False
                         equity.append(cash + (pos * curr_c))
-                        continue # 約定当日はエグジット判定をスキップ
+                        continue 
                     else:
-                        # 指値に刺さらなかった場合はキャンセル
                         pending_entry = False
 
-                # 当日の終値ベースで新規シグナル判定
                 if not pending_entry and AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix):
                     target_limit_price = AdvancedStrategyAnalyzer.calculate_limit_price(row, self.attr, n_chg)
                     pending_entry = True
 
             else:
                 high_p = max(high_p, curr_c)
-                current_atr = float(row.get('atr', 0))
+                current_atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 0.0))
                 ch = max(high_p - (current_atr * atr_mult), entry_p - (current_atr * atr_mult))
                 
                 score = 0
@@ -206,12 +213,12 @@ class IntegratedBacktester:
 
                 if self.attr in ["スイング", "押し目"]:
                     if bool(row.get('bb_p1_cross_down', False)): score += 20
-                    if float(row.get('ma5', 0)) < float(row.get('ma25', 0)) and float(row.get('vol_ratio', 0)) >= 1.0: score += 15
-                    if float(row.get('macd', 0)) < float(row.get('sig', 0)) and float(row.get('vol_ratio', 0)) >= 1.0: score += 15
+                    if AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0)) and AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 0)) >= 1.0: score += 15
+                    if AdvancedStrategyAnalyzer._to_float(row.get('macd', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('sig', 0)) and AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 0)) >= 1.0: score += 15
                 elif "中長期" in self.attr:
-                    if float(row.get('rsi', 0)) > 85: score += 10
+                    if AdvancedStrategyAnalyzer._to_float(row.get('rsi', 0)) > 85: score += 10
                 
-                if float(row.get('rs', 0)) < -5: score += 5
+                if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: score += 5
 
                 if score >= 80:
                     cash += pos * curr_c
@@ -232,24 +239,18 @@ class IntegratedBacktester:
 def run_integrity_tests() -> None:
     print("[TEST] Running integrity and edge-case tests...")
     
-    # 1. 空データに対する堅牢性
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # 2. 指値計算の検証 (ATR=30, Close=1000, 属性=スイング)
-    # 期待値: 1000 - (30 * 0.3) = 991
     dummy_row_limit = pd.Series({'close': 1000.0, 'atr': 30.0})
     limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", 0.0)
     assert limit_p == 991.0, f"Limit price calculation failed. Expected 991.0, got {limit_p}"
     
-    # 3. ギャップダウン時の指値計算 (NASDAQ -1.0%下落時)
-    # price_shift = 1000 * 0.01 = 10.0
-    # 期待値: 1000 - (30 * 0.3) - 10.0 = 981
     limit_p_gap = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", -1.0)
     assert limit_p_gap == 981.0, f"Hybrid limit price calculation failed. Expected 981.0, got {limit_p_gap}"
 
-    # 4. 異常値・欠損値の型チェック
+    # 【検証】異常な文字列やNaNが混入してもクラッシュしないことの証明
     dummy_row_err = pd.Series({'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None})
     try:
         res = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
