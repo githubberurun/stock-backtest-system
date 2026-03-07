@@ -160,7 +160,7 @@ class AdvancedStrategyAnalyzer:
 # ==========================================
 class USMarketCache:
     def __init__(self) -> None:
-        print("[INFO] Caching US market data (Shared instance)...")
+        print("[INFO] Caching US market data...")
         try:
             ndx_data = yf.Ticker("^IXIC").history(period="10y")
             vix_data = yf.Ticker("^VIX").history(period="10y")
@@ -186,7 +186,6 @@ class USMarketCache:
         return 0.0, 15.0
 
 class IntegratedBacktester:
-    # 【改修】共有のUSMarketCacheを受け取れるように引数を追加
     def __init__(self, ticker: str, initial_cash: float = 1000000.0, attr: str = "スイング", us_market: Optional[USMarketCache] = None) -> None:
         if not isinstance(ticker, str): raise TypeError("ticker must be string")
         self.ticker: str = ticker
@@ -228,6 +227,7 @@ class IntegratedBacktester:
                 if pending_entry:
                     if curr_l <= target_limit_price:
                         entry_p = min(curr_o, target_limit_price)
+                        # 【複利ロジック】現在の全現金(cash)を投じて買えるだけ買う
                         pos = cash // entry_p
                         high_p = entry_p
                         cash -= pos * entry_p
@@ -286,17 +286,21 @@ class IntegratedBacktester:
 
             equity.append(cash + (pos * curr_c if pos > 0 else 0))
 
+        # 最終到達金額の計算
         final = equity[-1] if equity else self.cash
         mdd_series = (pd.Series(equity) - pd.Series(equity).cummax()) / pd.Series(equity).cummax()
         mdd = float(mdd_series.min()) if not mdd_series.empty and not pd.isna(mdd_series.min()) else 0.0
         
-        # 数値のままReturnを保存し、表示時のみフォーマットする（集計用）
         ret_val = (final - self.cash) / self.cash
         
+        # 【改修】金額(絶対額)の推移をディクショナリに追加
         return {
             "Ticker": self.ticker, 
             "Return_Raw": ret_val,
             "Return": f"{ret_val:.2%}", 
+            "Initial_Cash": self.cash,
+            "Final_Cash": final,
+            "Net_Profit": final - self.cash,
             "MDD": f"{mdd:.2%}", 
             "Trades": len(trades)
         }
@@ -329,20 +333,17 @@ def run_integrity_tests() -> None:
     except Exception as e:
         raise AssertionError(f"Failed to handle corrupted data: {e}")
         
-    # 型チェック例外テスト
     try:
         AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0) # type: ignore
         assert False, "evaluate_entry should raise TypeError for non-Series input"
     except TypeError:
         pass
-        
+
     print("[TEST] All tests passed.")
 
 if __name__ == "__main__":
     run_integrity_tests()
-    
     try:
-        # 米国市場データを1回だけ取得し、メモリ上で共有（APIアクセス制限回避）
         shared_us_market = USMarketCache()
         
         results_list = []
@@ -351,39 +352,52 @@ if __name__ == "__main__":
         if not os.path.exists(data_dir):
             raise FileNotFoundError(f"Directory '{data_dir}' not found. Please run data_fetcher.py first.")
             
-        # 13060（ベンチマーク）以外のすべてのParquetファイルをリストアップ
         files = [f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet"]
         
         print(f"[INFO] Starting batch backtest for {len(files)} tickers...")
+        
+        # 【改修】初期資金は一律100万円でスタート
+        STARTING_CAPITAL = 1000000.0
         
         for i, file in enumerate(files):
             ticker_code = file.replace(".parquet", "")
             print(f"[{i+1}/{len(files)}] Testing {ticker_code}...", end=" ")
             
             try:
-                tester = IntegratedBacktester(ticker_code, us_market=shared_us_market)
+                tester = IntegratedBacktester(ticker_code, initial_cash=STARTING_CAPITAL, us_market=shared_us_market)
                 res = tester.run()
-                # 表示用カラムを整える
-                display_res = {
-                    "Ticker": res["Ticker"],
-                    "Return": res["Return"],
-                    "MDD": res["MDD"],
-                    "Trades": res["Trades"]
-                }
                 results_list.append(res)
-                print(f"Return: {res['Return']}, Trades: {res['Trades']}")
+                # ターミナルに最終到達金額（Final Cash）を表示
+                print(f"Final: ¥{int(res['Final_Cash']):,}, Return: {res['Return']}, Trades: {res['Trades']}")
             except Exception as e:
                 print(f"FAILED ({e})")
 
         if results_list:
             df_results = pd.DataFrame(results_list)
-            # 生のReturn_Rawを使って平均リターンを計算し、保存前に削除
-            avg_return = df_results['Return_Raw'].mean()
-            df_results = df_results.drop(columns=['Return_Raw'])
             
+            avg_return = df_results['Return_Raw'].mean()
+            
+            # --- 【改修】ポートフォリオ全体の複利シミュレーションサマリー ---
+            # もし100万円の資金を、これら300銘柄に均等分散（1銘柄あたり約3,333円）して
+            # スタートさせた場合、10年後に全体でいくらになったか（平均リターンから逆算）
+            simulated_final_portfolio = STARTING_CAPITAL * (1 + avg_return)
+            net_profit_portfolio = simulated_final_portfolio - STARTING_CAPITAL
+            
+            df_results = df_results.drop(columns=['Return_Raw'])
             df_results.to_csv("backtest_report.csv", index=False)
+            
             print(f"\n[SUCCESS] Batch backtest completed. Report saved to backtest_report.csv")
-            print(f"[SUMMARY] Total Tickers: {len(results_list)} | Average Return: {avg_return:.2%}")
+            print(f"[SUMMARY] Total Tickers: {len(results_list)}")
+            print(f"[SUMMARY] Average Return: {avg_return:.2%}")
+            print(f"\n==================================================")
+            print(f" 📊 PORTFOLIO COMPOUND SIMULATION (10 Years)")
+            print(f"==================================================")
+            print(f" 初期資金 1,000,000円 を、これら全 {len(results_list)} 銘柄に")
+            print(f" 分散投資し、各銘柄内で出た利益を全額再投資（複利）した場合：")
+            print(f"")
+            print(f" ▶ 最終資産額 (Final Value): ¥{int(simulated_final_portfolio):,}")
+            print(f" ▶ 純利益額 (Net Profit)   : ¥{int(net_profit_portfolio):,}")
+            print(f"==================================================")
         else:
             print("[WARN] No backtest results generated.")
             
