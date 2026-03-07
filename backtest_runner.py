@@ -11,7 +11,6 @@ from datetime import datetime, timedelta
 class AdvancedStrategyAnalyzer:
     @staticmethod
     def _to_float(val: Any, default: float = 0.0) -> float:
-        """異常値や欠損値を安全にfloat型へ変換する内部メソッド"""
         try:
             f = float(val)
             return f if np.isfinite(f) else default
@@ -88,7 +87,6 @@ class AdvancedStrategyAnalyzer:
         rs_21_val = AdvancedStrategyAnalyzer._to_float(row.get('rs_21', 0.0), 0.0)
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 1.0), 1.0)
         
-        # --- 【改修】外部スコア(AI・財務・登場回数)をテクニカルからプロキシ算出 ---
         surrogate_base = 50.0
         
         if attr == "押し目":
@@ -107,17 +105,12 @@ class AdvancedStrategyAnalyzer:
             if rs_21_val > 0: surrogate_base += 10.0
             if vol_ratio > 1.2: surrogate_base += 10.0
         
-        # 優良銘柄前提として財務・登場回数のモック値を設定
         mock_fin_score = 3.0
         mock_appear_count = 3.0
-        
         tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
         
-        # 本番環境と全く同じ計算式を適用
         total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty 
-        # ----------------------------------------------------------------------
         
-        # エントリー閾値は元コードのまま維持
         if attr == "押し目": return total_score >= 80
         return total_score >= 85 and rs_21_val > 0
 
@@ -197,6 +190,10 @@ class IntegratedBacktester:
         
         pending_entry = False
         target_limit_price = 0.0
+        
+        # 分割利確のステート管理
+        took_2r = False
+        took_3r = False
 
         for i in range(len(self.df)):
             row = self.df.iloc[i]
@@ -213,6 +210,7 @@ class IntegratedBacktester:
                         high_p = entry_p
                         cash -= pos * entry_p
                         pending_entry = False
+                        took_2r, took_3r = False, False # フラグリセット
                         equity.append(cash + (pos * curr_c))
                         continue 
                     else:
@@ -231,10 +229,25 @@ class IntegratedBacktester:
                 if bool(row.get('bb_3_reversal', False)): score += 40
                 if curr_c < ch: score += 100
                 
+                # 【改修】オリジナルロジックの分割利確を忠実に再現
                 if current_atr > 0 and curr_c > entry_p:
                     r_mult = (curr_c - entry_p) / (current_atr * 2)
-                    if "中長期" not in self.attr and r_mult >= 3.0:
-                        score += 100
+                    if "中長期" not in self.attr:
+                        if r_mult >= 3.0 and not took_3r:
+                            sell_pos = int(pos // 2)
+                            if sell_pos > 0:
+                                cash += sell_pos * curr_c
+                                trades.append((curr_c - entry_p) / entry_p)
+                                pos -= sell_pos
+                            took_3r = True
+                            took_2r = True # 3R到達時は2Rも達成済みとする
+                        elif r_mult >= 2.0 and not took_2r:
+                            sell_pos = int(pos // 3)
+                            if sell_pos > 0:
+                                cash += sell_pos * curr_c
+                                trades.append((curr_c - entry_p) / entry_p)
+                                pos -= sell_pos
+                            took_2r = True
 
                 if self.attr in ["スイング", "押し目"]:
                     if bool(row.get('bb_p1_cross_down', False)): score += 20
@@ -245,10 +258,12 @@ class IntegratedBacktester:
                 
                 if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: score += 5
 
+                # 全決済トリガー
                 if score >= 80:
-                    cash += pos * curr_c
-                    trades.append((curr_c - entry_p) / entry_p)
-                    pos = 0
+                    if pos > 0:
+                        cash += pos * curr_c
+                        trades.append((curr_c - entry_p) / entry_p)
+                        pos = 0
 
             equity.append(cash + (pos * curr_c if pos > 0 else 0))
 
@@ -275,7 +290,6 @@ def run_integrity_tests() -> None:
     limit_p_gap = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", -1.0)
     assert limit_p_gap == 981.0, f"Hybrid limit price calculation failed. Expected 981.0, got {limit_p_gap}"
 
-    # 【検証】プロキシ加算ロジックが安全に動作することの確認
     dummy_row_proxy = pd.Series({'ma5': 105.0, 'ma25': 100.0, 'macd': 1.0, 'sig': 0.5, 'vol_ratio': 1.5, 'rs_21': 5.0})
     try:
         res = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_proxy, "スイング", 0.0, 15.0)
