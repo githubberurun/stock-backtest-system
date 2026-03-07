@@ -21,7 +21,7 @@ class AdvancedStrategyAnalyzer:
     def calculate_indicators(df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df must be a pandas DataFrame")
-        if df.empty or len(df) < 200: # 200日MAを計算するため最低200行必要
+        if df.empty or len(df) < 200: 
             return df
             
         df.columns = [str(c).lower() for c in df.columns]
@@ -43,7 +43,6 @@ class AdvancedStrategyAnalyzer:
         df['bb_p1'] = df['ma20'] + df['std20'] 
         df['prev_low'] = df['low'].shift(1)
         
-        # 【改修】main.py同期用の追加インジケーター (75MA, 200MA, BB幅)
         df['ma75'] = df['close'].rolling(window=75).mean()
         df['ma200'] = df['close'].rolling(window=200).mean()
         df['bb_width'] = np.where(df['ma20'] > 0, (df['std20'] * 4) / df['ma20'], 0)
@@ -64,7 +63,6 @@ class AdvancedStrategyAnalyzer:
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
         
-        # 【改修】main.py同期用: 5日前のRSIとの差分（モメンタム）
         df['rsi_slope'] = df['rsi'] - df['rsi'].shift(5)
         
         tr = pd.concat([
@@ -105,7 +103,6 @@ class AdvancedStrategyAnalyzer:
         bb_width = AdvancedStrategyAnalyzer._to_float(row.get('bb_width', 1.0))
         rsi_slope = AdvancedStrategyAnalyzer._to_float(row.get('rsi_slope', 0.0))
         
-        # --- 【改修】main.py の get_evaluation() を完全にシミュレート ---
         main_score = 0.0
         
         if attr == "押し目":
@@ -114,11 +111,9 @@ class AdvancedStrategyAnalyzer:
                 if curr_c < m25 and rsi_val <= 35 and vol_ratio < 0.8: main_score += 100
                 elif curr_c < m25 and rsi_val <= 45 and vol_ratio <= 1.0: main_score += 60
                 
-                # ボラティリティ収縮（VCP）検知
                 if bb_width <= 0.10 and vol_ratio <= 0.8:
                     main_score += 40
         else:
-            # スイング
             if vol_ratio >= 2.0: main_score += 40
             elif vol_ratio >= 1.5: main_score += 20
             
@@ -133,12 +128,10 @@ class AdvancedStrategyAnalyzer:
             
             if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 20
             
-            # 財務指標・Zスコアのモック値加算（優良銘柄前提）
             main_score += 30 
             
         surrogate_base = min(100.0, main_score)
         
-        # --- deep_analyzer.py 側の最終スコア計算 ---
         mock_fin_score = 3.0
         mock_appear_count = 3.0
         tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
@@ -167,7 +160,7 @@ class AdvancedStrategyAnalyzer:
 # ==========================================
 class USMarketCache:
     def __init__(self) -> None:
-        print("[INFO] Caching US market data...")
+        print("[INFO] Caching US market data (Shared instance)...")
         try:
             ndx_data = yf.Ticker("^IXIC").history(period="10y")
             vix_data = yf.Ticker("^VIX").history(period="10y")
@@ -183,6 +176,7 @@ class USMarketCache:
             self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
 
     def get_state(self, date_str: str) -> Tuple[float, float]:
+        if not isinstance(date_str, str): raise TypeError("date_str must be string")
         if self.ndx.empty or self.vix.empty: return 0.0, 15.0
         dt = datetime.strptime(date_str, '%Y-%m-%d')
         for i in range(1, 6):
@@ -192,10 +186,13 @@ class USMarketCache:
         return 0.0, 15.0
 
 class IntegratedBacktester:
-    def __init__(self, ticker: str, initial_cash: float = 1000000.0, attr: str = "スイング") -> None:
+    # 【改修】共有のUSMarketCacheを受け取れるように引数を追加
+    def __init__(self, ticker: str, initial_cash: float = 1000000.0, attr: str = "スイング", us_market: Optional[USMarketCache] = None) -> None:
+        if not isinstance(ticker, str): raise TypeError("ticker must be string")
         self.ticker: str = ticker
         self.cash: float = initial_cash
         self.attr: str = attr
+        self.us_market = us_market if us_market else USMarketCache()
         
         file_path = f"data/{ticker}.parquet" 
         if os.path.exists(file_path):
@@ -210,7 +207,6 @@ class IntegratedBacktester:
         self.df = AdvancedStrategyAnalyzer.calculate_indicators(target_df, bm_df)
         if not self.df.empty:
             self.df['date_str'] = pd.to_datetime(self.df['date']).dt.strftime('%Y-%m-%d')
-        self.us_market = USMarketCache()
 
     def run(self) -> Dict[str, Any]:
         cash, pos, entry_p, high_p = self.cash, 0.0, 0.0, 0.0
@@ -294,7 +290,16 @@ class IntegratedBacktester:
         mdd_series = (pd.Series(equity) - pd.Series(equity).cummax()) / pd.Series(equity).cummax()
         mdd = float(mdd_series.min()) if not mdd_series.empty and not pd.isna(mdd_series.min()) else 0.0
         
-        return {"Ticker": self.ticker, "Return": f"{(final-self.cash)/self.cash:.2%}", "MDD": f"{mdd:.2%}", "Trades": len(trades)}
+        # 数値のままReturnを保存し、表示時のみフォーマットする（集計用）
+        ret_val = (final - self.cash) / self.cash
+        
+        return {
+            "Ticker": self.ticker, 
+            "Return_Raw": ret_val,
+            "Return": f"{ret_val:.2%}", 
+            "MDD": f"{mdd:.2%}", 
+            "Trades": len(trades)
+        }
 
 # ==========================================
 # 3. 堅牢性テスト & メイン実行
@@ -310,10 +315,8 @@ def run_integrity_tests() -> None:
     limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", 0.0)
     assert limit_p == 991.0, f"Limit price calculation failed. Expected 991.0, got {limit_p}"
     
-    # 【検証】main.py のVCP判定（ボラティリティ収縮）がスコアに反映されるか
     dummy_row_vcp = pd.Series({'ma25': 105.0, 'ma75': 110.0, 'ma200': 100.0, 'close': 106.0, 'rsi': 30.0, 'vol_ratio': 0.5, 'bb_width': 0.05, 'rs_21': 5.0})
     try:
-        # VCP+押し目条件なので高得点になるはず
         res = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_vcp, "押し目", 0.0, 15.0)
         assert isinstance(res, bool), "evaluate_entry must return bool with VCP proxy logic"
     except Exception as e:
@@ -326,14 +329,63 @@ def run_integrity_tests() -> None:
     except Exception as e:
         raise AssertionError(f"Failed to handle corrupted data: {e}")
         
+    # 型チェック例外テスト
+    try:
+        AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0) # type: ignore
+        assert False, "evaluate_entry should raise TypeError for non-Series input"
+    except TypeError:
+        pass
+        
     print("[TEST] All tests passed.")
 
 if __name__ == "__main__":
     run_integrity_tests()
+    
     try:
-        tester = IntegratedBacktester("7203")
-        res = tester.run()
-        print(f"[RESULT] {res}")
-        pd.DataFrame([res]).to_csv("backtest_report.csv", index=False)
+        # 米国市場データを1回だけ取得し、メモリ上で共有（APIアクセス制限回避）
+        shared_us_market = USMarketCache()
+        
+        results_list = []
+        data_dir = "data"
+        
+        if not os.path.exists(data_dir):
+            raise FileNotFoundError(f"Directory '{data_dir}' not found. Please run data_fetcher.py first.")
+            
+        # 13060（ベンチマーク）以外のすべてのParquetファイルをリストアップ
+        files = [f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet"]
+        
+        print(f"[INFO] Starting batch backtest for {len(files)} tickers...")
+        
+        for i, file in enumerate(files):
+            ticker_code = file.replace(".parquet", "")
+            print(f"[{i+1}/{len(files)}] Testing {ticker_code}...", end=" ")
+            
+            try:
+                tester = IntegratedBacktester(ticker_code, us_market=shared_us_market)
+                res = tester.run()
+                # 表示用カラムを整える
+                display_res = {
+                    "Ticker": res["Ticker"],
+                    "Return": res["Return"],
+                    "MDD": res["MDD"],
+                    "Trades": res["Trades"]
+                }
+                results_list.append(res)
+                print(f"Return: {res['Return']}, Trades: {res['Trades']}")
+            except Exception as e:
+                print(f"FAILED ({e})")
+
+        if results_list:
+            df_results = pd.DataFrame(results_list)
+            # 生のReturn_Rawを使って平均リターンを計算し、保存前に削除
+            avg_return = df_results['Return_Raw'].mean()
+            df_results = df_results.drop(columns=['Return_Raw'])
+            
+            df_results.to_csv("backtest_report.csv", index=False)
+            print(f"\n[SUCCESS] Batch backtest completed. Report saved to backtest_report.csv")
+            print(f"[SUMMARY] Total Tickers: {len(results_list)} | Average Return: {avg_return:.2%}")
+        else:
+            print("[WARN] No backtest results generated.")
+            
     except Exception as e:
         print(f"[FATAL] {e}")
