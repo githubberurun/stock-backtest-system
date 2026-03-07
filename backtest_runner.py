@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 class AdvancedStrategyAnalyzer:
     @staticmethod
     def _to_float(val: Any, default: float = 0.0) -> float:
+        """異常値や欠損値を安全にfloat型へ変換する内部メソッド"""
         try:
             f = float(val)
             return f if np.isfinite(f) else default
@@ -30,6 +31,9 @@ class AdvancedStrategyAnalyzer:
         if not required_cols.issubset(set(df.columns)):
             missing = required_cols - set(df.columns)
             raise KeyError(f"DataFrameに必須列が不足しています: {missing}。列名が異なる場合は事前に小文字にリネームしてください。")
+
+        # 【改修】初動検知用の前日データ
+        df['prev_close'] = df['close'].shift(1)
 
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
@@ -52,10 +56,17 @@ class AdvancedStrategyAnalyzer:
         df['macd'] = df['ema12'] - df['ema26']
         df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
         
+        # 【改修】遅行指標のトラップを避けるための「直近3日以内のクロス」検知
+        ma5_cross_up = (df['ma5'] > df['ma25']) & (df['ma5'].shift(1) <= df['ma25'].shift(1))
+        macd_cross_up = (df['macd'] > df['sig']) & (df['macd'].shift(1) <= df['sig'].shift(1))
+        df['recent_ma_cross'] = ma5_cross_up.rolling(window=3).max().fillna(0) > 0
+        df['recent_macd_cross'] = macd_cross_up.rolling(window=3).max().fillna(0) > 0
+        
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
+        df['prev_rsi'] = df['rsi'].shift(1)
         
         tr = pd.concat([
             (df['high'] - df['low']), 
@@ -87,30 +98,50 @@ class AdvancedStrategyAnalyzer:
         rs_21_val = AdvancedStrategyAnalyzer._to_float(row.get('rs_21', 0.0), 0.0)
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 1.0), 1.0)
         
+        curr_c = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
+        prev_c = AdvancedStrategyAnalyzer._to_float(row.get('prev_close', 0.0))
+        
         surrogate_base = 50.0
         
         if attr == "押し目":
-            if dev25_val < 0: surrogate_base += 15.0
-            if rsi_val < 40.0: surrogate_base += 15.0
+            prev_rsi = AdvancedStrategyAnalyzer._to_float(row.get('prev_rsi', 50.0))
+            is_rebounding = (curr_c > prev_c) and (rsi_val > prev_rsi)
+            
+            # 落ちるナイフを避け、反転の「初動」を強く評価
+            if dev25_val < -2.0 and is_rebounding: surrogate_base += 25.0
+            elif dev25_val < 0: surrogate_base += 5.0
+            
             if rs_21_val > -5.0: surrogate_base += 10.0 
-            if vol_ratio > 1.2: surrogate_base += 10.0
+            if vol_ratio > 1.2 and is_rebounding: surrogate_base += 15.0
         else:
             ma5 = AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0.0))
             ma25 = AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0.0))
-            macd = AdvancedStrategyAnalyzer._to_float(row.get('macd', 0.0))
-            sig = AdvancedStrategyAnalyzer._to_float(row.get('sig', 0.0))
+            recent_ma_cross = bool(row.get('recent_ma_cross', False))
+            recent_macd_cross = bool(row.get('recent_macd_cross', False))
             
-            if ma5 > 0 and ma25 > 0 and ma5 > ma25: surrogate_base += 15.0
-            if macd > sig: surrogate_base += 15.0
-            if rs_21_val > 0: surrogate_base += 10.0
-            if vol_ratio > 1.2: surrogate_base += 10.0
+            # 大陽線＋出来高急増（AIが好材料を検知した際の疑似的リアクション）
+            price_surge = (prev_c > 0) and ((curr_c / prev_c) > 1.02) and (vol_ratio > 1.5)
+            
+            # 遅行指標の「状態」ではなく「クロス直後」に限定して加点し、高値掴みを防止
+            if recent_ma_cross: surrogate_base += 20.0
+            elif ma5 > ma25: surrogate_base += 5.0
+            
+            if recent_macd_cross: surrogate_base += 20.0
+            elif AdvancedStrategyAnalyzer._to_float(row.get('macd', 0.0)) > AdvancedStrategyAnalyzer._to_float(row.get('sig', 0.0)): surrogate_base += 5.0
+            
+            if price_surge: surrogate_base += 15.0
+            elif vol_ratio > 1.2: surrogate_base += 5.0
+            
+            if rs_21_val > 0: surrogate_base += 5.0
         
+        # 本番ベースのモックデータ（優良銘柄の前提）
         mock_fin_score = 3.0
         mock_appear_count = 3.0
         tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
         
         total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty 
         
+        # 厳しいエントリー閾値は維持
         if attr == "押し目": return total_score >= 80
         return total_score >= 85 and rs_21_val > 0
 
@@ -191,7 +222,6 @@ class IntegratedBacktester:
         pending_entry = False
         target_limit_price = 0.0
         
-        # 分割利確のステート管理
         took_2r = False
         took_3r = False
 
@@ -210,7 +240,7 @@ class IntegratedBacktester:
                         high_p = entry_p
                         cash -= pos * entry_p
                         pending_entry = False
-                        took_2r, took_3r = False, False # フラグリセット
+                        took_2r, took_3r = False, False 
                         equity.append(cash + (pos * curr_c))
                         continue 
                     else:
@@ -229,7 +259,6 @@ class IntegratedBacktester:
                 if bool(row.get('bb_3_reversal', False)): score += 40
                 if curr_c < ch: score += 100
                 
-                # 【改修】オリジナルロジックの分割利確を忠実に再現
                 if current_atr > 0 and curr_c > entry_p:
                     r_mult = (curr_c - entry_p) / (current_atr * 2)
                     if "中長期" not in self.attr:
@@ -240,7 +269,7 @@ class IntegratedBacktester:
                                 trades.append((curr_c - entry_p) / entry_p)
                                 pos -= sell_pos
                             took_3r = True
-                            took_2r = True # 3R到達時は2Rも達成済みとする
+                            took_2r = True 
                         elif r_mult >= 2.0 and not took_2r:
                             sell_pos = int(pos // 3)
                             if sell_pos > 0:
@@ -258,7 +287,6 @@ class IntegratedBacktester:
                 
                 if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: score += 5
 
-                # 全決済トリガー
                 if score >= 80:
                     if pos > 0:
                         cash += pos * curr_c
@@ -290,7 +318,11 @@ def run_integrity_tests() -> None:
     limit_p_gap = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", -1.0)
     assert limit_p_gap == 981.0, f"Hybrid limit price calculation failed. Expected 981.0, got {limit_p_gap}"
 
-    dummy_row_proxy = pd.Series({'ma5': 105.0, 'ma25': 100.0, 'macd': 1.0, 'sig': 0.5, 'vol_ratio': 1.5, 'rs_21': 5.0})
+    dummy_row_proxy = pd.Series({
+        'ma5': 105.0, 'ma25': 100.0, 'recent_ma_cross': True, 
+        'macd': 1.0, 'sig': 0.5, 'recent_macd_cross': True, 
+        'vol_ratio': 1.5, 'rs_21': 5.0, 'close': 105.0, 'prev_close': 100.0
+    })
     try:
         res = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_proxy, "スイング", 0.0, 15.0)
         assert isinstance(res, bool), "evaluate_entry must return bool even with proxy logic"
