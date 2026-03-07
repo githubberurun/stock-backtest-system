@@ -5,6 +5,11 @@ import yfinance as yf
 from typing import Dict, List, Any, Optional, Final, Tuple
 from datetime import datetime, timedelta
 
+def debug_log(msg: str) -> None:
+    """内部デバッグ用のロギング関数"""
+    if not isinstance(msg, str): raise TypeError("msg must be a string")
+    print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}")
+
 # ==========================================
 # 1. 統合分析エンジン (Entry & Exit & Limit Price)
 # ==========================================
@@ -67,22 +72,33 @@ class AdvancedStrategyAnalyzer:
         df['atr'] = tr.rolling(window=14).mean() 
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
 
+        # 【改修】ベンチマークの指標計算と結合
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
-            df = df.merge(benchmark_df[['date', 'close']], on='date', how='left', suffixes=('', '_bm'))
+            benchmark_df['bm_ma200'] = benchmark_df['close'].rolling(window=200).mean()
+            df = df.merge(benchmark_df[['date', 'close', 'bm_ma200']], on='date', how='left', suffixes=('', '_bm'))
             df['close_bm'] = df['close_bm'].ffill()
+            df['bm_ma200'] = df['bm_ma200'].ffill()
             df['rs_21'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
             df['rs'] = df['rs_21']
         else:
             df['rs_21'] = 0.0
             df['rs'] = 0.0
+            df['close_bm'] = 0.0
+            df['bm_ma200'] = 0.0
 
         return df
 
     @staticmethod
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float]:
-        """【改修】シグナルの有無と、優先順位付けのためのトータルスコアを返すように変更"""
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
+        
+        # --- 【新設】市場全体マクロ・キルスイッチ ---
+        bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
+        bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
+        if bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200:
+            return False, 0.0  # ベンチマークが200日線を割っている場合は全エントリーを強制遮断
+        
         if n_chg <= -2.0 or vix >= 20.0: return False, 0.0
         
         curr_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
@@ -142,6 +158,7 @@ class AdvancedStrategyAnalyzer:
 # ==========================================
 class USMarketCache:
     def __init__(self) -> None:
+        debug_log("Caching US market data...")
         try:
             ndx_data = yf.Ticker("^IXIC").history(period="10y")
             vix_data = yf.Ticker("^VIX").history(period="10y")
@@ -166,7 +183,6 @@ class USMarketCache:
         return 0.0, 15.0
 
 class PortfolioBacktester:
-    """【新設】資金を複数銘柄間で動的に回転させるクロスセクション・バックテスター"""
     def __init__(self, data_dir: str, initial_cash: float = 1000000.0, max_positions: int = 5) -> None:
         if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
         self.cash: float = initial_cash
@@ -175,7 +191,7 @@ class PortfolioBacktester:
         self.attr: str = "スイング"
         self.us_market = USMarketCache()
         
-        print("[INFO] Loading and calculating indicators for all tickers...")
+        debug_log("Loading and calculating indicators for all tickers...")
         self.timeline: Dict[str, Dict[str, Dict[str, Any]]] = {}
         dates_set = set()
         
@@ -184,7 +200,6 @@ class PortfolioBacktester:
         
         files = [f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet"]
         
-        # データをメモリ上で日付ベースの辞書に変換（高速ループ用）
         for file in files:
             ticker = file.replace(".parquet", "")
             df = pd.read_parquet(f"{data_dir}/{file}")
@@ -201,21 +216,20 @@ class PortfolioBacktester:
                 self.timeline[d_str][ticker] = row
                 
         self.sorted_dates = sorted(list(dates_set))
-        print(f"[INFO] Timeline built. Total trading days: {len(self.sorted_dates)}")
+        debug_log(f"Timeline built. Total trading days: {len(self.sorted_dates)}")
 
     def run(self) -> Dict[str, Any]:
         cash = self.cash
-        positions: Dict[str, Dict[str, Any]] = {} # 保持中の銘柄
-        pending_orders: List[Dict[str, Any]] = [] # 翌日発動する指値注文
+        positions: Dict[str, Dict[str, Any]] = {} 
+        pending_orders: List[Dict[str, Any]] = [] 
         equity_curve: List[float] = []
         total_trades = 0
-        atr_mult = 2.5 # スイング用の標準値
+        atr_mult = 2.5 
 
         for date_str in self.sorted_dates:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
-            # --- 1. 待機中注文の約定処理 ---
             new_pending = []
             for order in pending_orders:
                 ticker = order['ticker']
@@ -226,7 +240,6 @@ class PortfolioBacktester:
                     limit_p = order['limit_price']
                     
                     if low_p <= limit_p:
-                        # 指値または始値で約定
                         exec_price = min(open_p, limit_p)
                         alloc_cash = order['allocated_cash']
                         qty = alloc_cash // exec_price
@@ -237,10 +250,8 @@ class PortfolioBacktester:
                                 'qty': qty, 'entry_p': exec_price, 'high_p': exec_price, 
                                 'took_2r': False, 'took_3r': False
                             }
-                # 注文は1日で失効するため new_pending には追加しない（引き継がない）
             pending_orders = new_pending
 
-            # --- 2. 保有銘柄の利確・損切り判定 ---
             closed_tickers = []
             for ticker, pos in positions.items():
                 if ticker not in today_market: continue
@@ -254,9 +265,8 @@ class PortfolioBacktester:
                 
                 exit_score = 0
                 if bool(row.get('bb_3_reversal', False)): exit_score += 40
-                if curr_c < ch_stop: exit_score += 100 # シャンデリアストップ発動
+                if curr_c < ch_stop: exit_score += 100 
                 
-                # 分割利確処理
                 if current_atr > 0 and curr_c > pos['entry_p']:
                     r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
                     if r_mult >= 3.0 and not pos['took_3r']:
@@ -275,13 +285,11 @@ class PortfolioBacktester:
                             total_trades += 1
                         pos['took_2r'] = True
                         
-                # テクニカルな出口サイン
                 if bool(row.get('bb_p1_cross_down', False)): exit_score += 20
                 if AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0)) and AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 0)) >= 1.0: exit_score += 15
                 if AdvancedStrategyAnalyzer._to_float(row.get('macd', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('sig', 0)) and AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 0)) >= 1.0: exit_score += 15
                 if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: exit_score += 5
                 
-                # 全決済
                 if exit_score >= 80:
                     cash += pos['qty'] * curr_c
                     total_trades += 1
@@ -290,23 +298,20 @@ class PortfolioBacktester:
             for ct in closed_tickers:
                 del positions[ct]
 
-            # --- 3. 新規エントリー候補の抽出（シグナル点灯） ---
             open_slots = self.max_positions - len(positions)
             if open_slots > 0 and cash > 0:
                 candidates = []
                 for ticker, row in today_market.items():
-                    if ticker in positions: continue # すでに保有している銘柄はスキップ
+                    if ticker in positions: continue 
                     
                     is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix)
                     if is_entry:
                         limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(row, self.attr, n_chg)
                         candidates.append((score, ticker, limit_p))
                 
-                # スコアが高い順（最も有望な銘柄順）にソートして発注
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 
                 for score, ticker, limit_p in candidates[:open_slots]:
-                    # 資金管理: 空きスロット数で均等割り、または全額（最大保有数に達しないためのガードレール）
                     target_alloc = cash / open_slots
                     pending_orders.append({
                         'ticker': ticker,
@@ -315,7 +320,6 @@ class PortfolioBacktester:
                     })
                     open_slots -= 1
 
-            # --- 4. 日次資産評価 (Equity Curve) ---
             daily_equity = cash
             for ticker, pos in positions.items():
                 if ticker in today_market:
@@ -323,10 +327,8 @@ class PortfolioBacktester:
                     daily_equity += pos['qty'] * curr_c
             equity_curve.append(daily_equity)
 
-        # 最終評価
         final_equity = equity_curve[-1] if equity_curve else self.initial_cash
         
-        # MDD計算
         if equity_curve:
             eq_series = pd.Series(equity_curve)
             cummax = eq_series.cummax()
@@ -350,7 +352,7 @@ class PortfolioBacktester:
 # 3. 堅牢性テスト & メイン実行
 # ==========================================
 def run_integrity_tests() -> None:
-    print("[TEST] Running integrity and edge-case tests...")
+    debug_log("Running integrity and edge-case tests...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -360,13 +362,11 @@ def run_integrity_tests() -> None:
     limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", 0.0)
     assert limit_p == 991.0, f"Limit price calculation failed. Expected 991.0, got {limit_p}"
     
-    dummy_row_vcp = {'ma25': 105.0, 'ma75': 110.0, 'ma200': 100.0, 'close': 106.0, 'rsi': 30.0, 'vol_ratio': 0.5, 'bb_width': 0.05, 'rs_21': 5.0}
-    try:
-        is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_vcp, "押し目", 0.0, 15.0)
-        assert isinstance(is_entry, bool), "evaluate_entry must return bool as first element"
-        assert isinstance(score, float), "evaluate_entry must return float as second element"
-    except Exception as e:
-        raise AssertionError(f"Failed to handle VCP proxy logic: {e}")
+    # 【検証】キルスイッチが正常に作動するか（ベンチマークが200日線割れの場合）
+    dummy_row_killswitch = {'close_bm': 1900.0, 'bm_ma200': 2000.0, 'close': 100.0, 'rsi': 50.0}
+    is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_killswitch, "スイング", 0.0, 15.0)
+    assert not is_entry, "Kill switch failed: Entry allowed when benchmark is below 200MA"
+    assert score == 0.0, "Kill switch failed: Score should be 0.0"
 
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
@@ -380,7 +380,7 @@ def run_integrity_tests() -> None:
     except TypeError:
         pass
 
-    print("[TEST] All tests passed.")
+    debug_log("All tests passed.")
 
 if __name__ == "__main__":
     run_integrity_tests()
@@ -393,7 +393,6 @@ if __name__ == "__main__":
         print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST")
         print("==================================================")
         
-        # 資金100万円、最大5銘柄分散（1銘柄あたり最大20万円）でポートフォリオ運用
         STARTING_CAPITAL = 1000000.0
         MAX_CONCURRENT_POSITIONS = 5
         
