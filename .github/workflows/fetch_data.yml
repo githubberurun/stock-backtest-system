@@ -1,12 +1,12 @@
-name: Weekly Data Fetching
+name: Weekly Backtest System
 
 on:
   schedule:
     - cron: '0 0 * * 0' # 毎週日曜日に実行
-  workflow_dispatch:      # 手動実行も可能にする
+  workflow_dispatch:      # 手動実行可能
 
 jobs:
-  build:
+  run-system:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -20,9 +20,21 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas pyarrow fastparquet
+          pip install requests pandas pyarrow fastparquet numpy
 
-      - name: Run Fetcher
+      - name: Execute Pipeline
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-        run: python data_fetcher.py
+        run: |
+          # 1. データ取得
+          python data_fetcher.py
+          # 2. バックテスト実行
+          python backtest_runner.py
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: |
+            data/*.parquet
+            backtest_report.csv
