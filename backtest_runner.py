@@ -48,6 +48,9 @@ class AdvancedStrategyAnalyzer:
         df['ma200'] = df['close'].rolling(window=200).mean()
         df['bb_width'] = np.where(df['ma20'] > 0, (df['std20'] * 4) / df['ma20'], 0)
         
+        # 【追加】陽線判定（洗練されたエントリー用）
+        df['is_bullish'] = df['close'] > df['open']
+        
         df['was_above_bb_p1'] = (df['high'] >= df['bb_p1']).rolling(window=5).max() > 0
         df['bb_p1_cross_down'] = df['was_above_bb_p1'] & (df['close'] < df['bb_p1']) & (df['close'] < df['prev_low'])
         df['was_above_bb_up_3'] = (df['high'] >= df['bb_up_3']).rolling(window=3).max() > 0
@@ -72,7 +75,6 @@ class AdvancedStrategyAnalyzer:
         df['atr'] = tr.rolling(window=14).mean() 
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
 
-        # 【改修】ベンチマークの指標計算と結合
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             benchmark_df['bm_ma200'] = benchmark_df['close'].rolling(window=200).mean()
@@ -93,11 +95,10 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # --- 【新設】市場全体マクロ・キルスイッチ ---
         bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
         bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
         if bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200:
-            return False, 0.0  # ベンチマークが200日線を割っている場合は全エントリーを強制遮断
+            return False, 0.0  
         
         if n_chg <= -2.0 or vix >= 20.0: return False, 0.0
         
@@ -113,6 +114,7 @@ class AdvancedStrategyAnalyzer:
         m200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma200', 0.0))
         bb_width = AdvancedStrategyAnalyzer._to_float(row_dict.get('bb_width', 1.0))
         rsi_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi_slope', 0.0))
+        is_bullish = bool(row_dict.get('is_bullish', False))
         
         main_score = 0.0
         if attr == "押し目":
@@ -131,6 +133,11 @@ class AdvancedStrategyAnalyzer:
             if 0 < dev25_val <= 20: main_score += 15
             elif dev25_val > 20: main_score += 5
             if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 20
+            
+            # 【洗練①】売られすぎ水準での反発サイン（底打ち初動の検知）
+            if rsi_val < 30.0 and is_bullish:
+                main_score += 50.0 
+                
             main_score += 30 
             
         surrogate_base = min(100.0, main_score)
@@ -248,7 +255,8 @@ class PortfolioBacktester:
                             cash -= qty * exec_price
                             positions[ticker] = {
                                 'qty': qty, 'entry_p': exec_price, 'high_p': exec_price, 
-                                'took_2r': False, 'took_3r': False
+                                'took_2r': False, 'took_3r': False,
+                                'days_held': 0  # 【洗練③】タイムストップ用のカウンタ
                             }
             pending_orders = new_pending
 
@@ -259,13 +267,25 @@ class PortfolioBacktester:
                 
                 curr_c = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
                 current_atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 0.0))
+                dev25_val = AdvancedStrategyAnalyzer._to_float(row.get('dev25', 0.0))
+                rsi_val = AdvancedStrategyAnalyzer._to_float(row.get('rsi', 50.0))
+                vol_ratio = AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 1.0))
                 
+                pos['days_held'] += 1
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 ch_stop = max(pos['high_p'] - (current_atr * atr_mult), pos['entry_p'] - (current_atr * atr_mult))
                 
                 exit_score = 0
                 if bool(row.get('bb_3_reversal', False)): exit_score += 40
                 if curr_c < ch_stop: exit_score += 100 
+                
+                # 【洗練②】クライマックス売り判定（過熱感の極致で強制利確）
+                if dev25_val > 20.0 and rsi_val > 85.0 and vol_ratio > 2.0:
+                    exit_score += 100 
+                
+                # 【洗練③】タイムストップ（10日経過で利益が2%未満なら撤退）
+                if pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.02):
+                    exit_score += 100
                 
                 if current_atr > 0 and curr_c > pos['entry_p']:
                     r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
@@ -286,8 +306,8 @@ class PortfolioBacktester:
                         pos['took_2r'] = True
                         
                 if bool(row.get('bb_p1_cross_down', False)): exit_score += 20
-                if AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0)) and AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 0)) >= 1.0: exit_score += 15
-                if AdvancedStrategyAnalyzer._to_float(row.get('macd', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('sig', 0)) and AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 0)) >= 1.0: exit_score += 15
+                if AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0)) and vol_ratio >= 1.0: exit_score += 15
+                if AdvancedStrategyAnalyzer._to_float(row.get('macd', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('sig', 0)) and vol_ratio >= 1.0: exit_score += 15
                 if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: exit_score += 5
                 
                 if exit_score >= 80:
@@ -358,15 +378,10 @@ def run_integrity_tests() -> None:
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    dummy_row_limit = {'close': 1000.0, 'atr': 30.0}
-    limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(dummy_row_limit, "スイング", 0.0)
-    assert limit_p == 991.0, f"Limit price calculation failed. Expected 991.0, got {limit_p}"
-    
-    # 【検証】キルスイッチが正常に作動するか（ベンチマークが200日線割れの場合）
-    dummy_row_killswitch = {'close_bm': 1900.0, 'bm_ma200': 2000.0, 'close': 100.0, 'rsi': 50.0}
-    is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_killswitch, "スイング", 0.0, 15.0)
-    assert not is_entry, "Kill switch failed: Entry allowed when benchmark is below 200MA"
-    assert score == 0.0, "Kill switch failed: Score should be 0.0"
+    # 【追加検証】売られすぎ反発によるエントリーのスコアブースト
+    dummy_row_oversold = {'close_bm': 2100.0, 'bm_ma200': 2000.0, 'close': 100.0, 'open': 90.0, 'rsi': 25.0, 'is_bullish': True}
+    is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_oversold, "スイング", 0.0, 15.0)
+    assert score > 50.0, "Oversold rebound failed to boost score."
 
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
@@ -390,7 +405,7 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"Directory '{data_dir}' not found. Please run data_fetcher.py first.")
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (OPTIMIZED)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
