@@ -3,6 +3,10 @@ name: Weekly Backtest System
 on:
   workflow_dispatch:      # 手動実行可能
 
+env:
+  # Node.js 20の非推奨警告への対応 (Node.js 24への強制移行フラグ)
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   run-system:
     runs-on: ubuntu-latest
@@ -23,6 +27,8 @@ jobs:
       - name: Execute Pipeline
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          # Pythonの標準出力をバッファリングせず即座にログへ書き出す設定
+          PYTHONUNBUFFERED: "1"
         run: |
           # JQUANTS_API_KEYが設定されていない場合はパイプラインを停止
           if [ -z "$JQUANTS_API_KEY" ]; then
@@ -31,15 +37,19 @@ jobs:
           fi
           
           # 1. データ取得 (対象銘柄 & ベンチマーク) & 内部テスト
-          python data_fetcher.py
+          # -u フラグでバッファリングを無効化し、リアルタイムでログを表示
+          python -u data_fetcher.py
           
-          # 2. 統合バックテスト実行 (前回のコードを backtest_runner.py と仮定)
-          python backtest_runner.py
+          # 2. 統合バックテスト実行
+          python -u backtest_runner.py
 
       - name: Upload Results
+        if: always() # エラーが起きても可能な限り結果をアップロード
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
           path: |
             data/*.parquet
+            data/*.txt
+            data/*.csv
             backtest_report.csv
