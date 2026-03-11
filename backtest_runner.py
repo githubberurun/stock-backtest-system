@@ -19,12 +19,15 @@ class AdvancedStrategyAnalyzer:
         try:
             f = float(val)
             return f if np.isfinite(f) else default
-        except (ValueError, TypeError): return default
+        except (ValueError, TypeError):
+            return default
 
     @staticmethod
     def calculate_indicators(df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        if not isinstance(df, pd.DataFrame): raise TypeError("df must be DataFrame")
-        if df.empty or len(df) < 200: return df
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("df must be a pandas DataFrame")
+        if df.empty or len(df) < 200: 
+            return df
             
         df.columns = [str(c).lower() for c in df.columns]
         required_cols = {'open', 'high', 'low', 'close', 'volume'}
@@ -48,9 +51,6 @@ class AdvancedStrategyAnalyzer:
         
         df['is_bullish'] = df['close'] > df['open']
         
-        bull_condition = df['close'] > df['open']
-        df['consecutive_bull_days'] = bull_condition.groupby((~bull_condition).cumsum()).cumsum()
-
         df['was_above_bb_p1'] = (df['high'] >= df['bb_p1']).rolling(window=5).max() > 0
         df['bb_p1_cross_down'] = df['was_above_bb_p1'] & (df['close'] < df['bb_p1']) & (df['close'] < df['prev_low'])
         df['was_above_bb_up_3'] = (df['high'] >= df['bb_up_3']).rolling(window=3).max() > 0
@@ -61,7 +61,6 @@ class AdvancedStrategyAnalyzer:
         df['macd'] = df['ema12'] - df['ema26']
         df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
         df['macd_hist'] = df['macd'] - df['sig']
-        df['is_macd_improving'] = df['macd_hist'] > df['macd_hist'].shift(1)
         
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -73,72 +72,101 @@ class AdvancedStrategyAnalyzer:
         df['atr'] = tr.rolling(window=14).mean() 
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
 
+        # ベンチマーク（TOPIX等）の結合とマクロ指標の算出
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
-            df = df.merge(benchmark_df[['date', 'close']], on='date', how='left', suffixes=('', '_bm'))
+            benchmark_df['bm_ma200'] = benchmark_df['close'].rolling(window=200).mean()
+            df = df.merge(benchmark_df[['date', 'close', 'bm_ma200']], on='date', how='left', suffixes=('', '_bm'))
             df['close_bm'] = df['close_bm'].ffill()
-            df['rs'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
+            df['bm_ma200'] = df['bm_ma200'].ffill()
+            df['rs_21'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
+            df['rs'] = df['rs_21']
         else:
+            df['rs_21'] = 0.0
             df['rs'] = 0.0
+            df['close_bm'] = 0.0
+            df['bm_ma200'] = 0.0
 
         return df
 
     @staticmethod
-    def evaluate_entry(row_dict: Dict[str, Any]) -> Tuple[bool, float]:
+    def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
+        # 1. 致命的なマクロ環境（弱気相場）でのエントリーを完全遮断
+        bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
+        bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
+        if bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200:
+            return False, 0.0  
+        
+        if n_chg <= -2.0 or vix >= 20.0: 
+            return False, 0.0
+
         curr_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
-        ma5 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma5', 0.0))
+        prev_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('prev_close', 0.0))
         rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0))
+        dev25_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0))
+        rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0))
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0))
+        bb_width = AdvancedStrategyAnalyzer._to_float(row_dict.get('bb_width', 1.0))
+        rsi_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi_slope', 0.0))
         is_bullish = bool(row_dict.get('is_bullish', False))
-        is_macd_improving = bool(row_dict.get('is_macd_improving', False))
-        consecutive_bull_days = int(row_dict.get('consecutive_bull_days', 0))
         
         mcap = AdvancedStrategyAnalyzer._to_float(row_dict.get('mcap', 0.0))
         mr_zscore = AdvancedStrategyAnalyzer._to_float(row_dict.get('mr_zscore', 0.0))
-        dev25_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0))
-
         is_small_cap = 0.0 < mcap < 500.0 if mcap > 0 else False
 
+        # 2. 小型株の需給悪化・異常乖離ネガティブカット
         if is_small_cap and (mr_zscore >= 1.0 or dev25_val <= -20.0):
             return False, 0.0
 
-        if curr_c >= ma5 or (is_small_cap and consecutive_bull_days >= 2):
-            return False, 0.0
-
-        main_score = 50.0 
+        # 3. 過去実績のあったスコアリングロジックの適用
+        main_score = 0.0
+        
         if vol_ratio >= 2.0: main_score += 40
         elif vol_ratio >= 1.5: main_score += 20
-        
         if 50 <= rsi_val <= 75: main_score += 15
         elif 75 < rsi_val <= 85: main_score += 5
-
+        elif rsi_val > 85 and curr_c < prev_c: main_score -= 10
+        if rsi_slope >= 10.0: main_score += 20
+        if 0 < dev25_val <= 20: main_score += 15
+        elif dev25_val > 20: main_score += 5
+        if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 20
+        
+        # 売られすぎ水準での反発サイン（底打ち初動の検知）
         if rsi_val < 30.0 and is_bullish:
-            if is_small_cap:
-                if is_macd_improving and vol_ratio >= 1.5: main_score += 50.0
-            else:
-                main_score += 50.0 
-                
-        is_entry = (main_score >= 80)
-        return is_entry, float(main_score)
+            main_score += 50.0 
+            
+        main_score += 30 
+        
+        surrogate_base = min(100.0, main_score)
+        mock_fin_score, mock_appear_count = 3.0, 3.0
+        tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
+        
+        total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty 
+        
+        is_entry = (total_score >= 85 and rs_21_val > 0)
+        return is_entry, float(total_score)
 
     @staticmethod
-    def get_order_params(row_dict: Dict[str, Any]) -> Tuple[float, float]:
+    def get_order_params(row_dict: Dict[str, Any], n_chg: float) -> Tuple[float, float]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         mcap = AdvancedStrategyAnalyzer._to_float(row_dict.get('mcap', 0.0))
         
         is_small_cap = 0.0 < mcap < 500.0 if mcap > 0 else False
+        nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
         
+        # 小型株の指値と損切幅をマイルドに最適化
         if is_small_cap:
-            limit_price = curr_price - (atr * 1.5)
-            atr_mult = 3.0 
+            base_offset = 0.8
+            atr_mult = 2.5 
         else:
-            limit_price = curr_price - (atr * 0.3)
-            atr_mult = 2.5
+            base_offset = 0.3
+            atr_mult = 2.0
             
+        limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price)), float(atr_mult)
 
 # ==========================================
@@ -171,10 +199,11 @@ class USMarketCache:
         return 0.0, 15.0
 
 class PortfolioBacktester:
-    def __init__(self, data_dir: str, initial_cash: float = 1000000.0) -> None:
+    def __init__(self, data_dir: str, initial_cash: float = 1000000.0, max_positions: int = 10) -> None:
         if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
         self.cash: float = initial_cash
         self.initial_cash: float = initial_cash
+        self.max_positions: int = max_positions
         self.us_market = USMarketCache()
         
         debug_log("Loading and calculating indicators for all tickers...")
@@ -204,7 +233,6 @@ class PortfolioBacktester:
         debug_log(f"Timeline built. Total trading days: {len(self.sorted_dates)}")
 
     def _calculate_total_equity(self, today_market: Dict[str, Dict[str, Any]], positions: Dict[str, Dict[str, Any]]) -> float:
-        """現在の口座総資産（現金＋建玉の評価額）を計算"""
         equity = self.cash
         for ticker, pos in positions.items():
             if ticker in today_market:
@@ -229,7 +257,8 @@ class PortfolioBacktester:
             new_pending = []
             for order in pending_orders:
                 ticker = order['ticker']
-                if ticker in today_market:
+                # 最大保有数の制限内でのみ約定を許可
+                if ticker in today_market and (ticker in positions or len(positions) < self.max_positions):
                     row = today_market[ticker]
                     low_p = AdvancedStrategyAnalyzer._to_float(row.get('low', 0.0))
                     open_p = AdvancedStrategyAnalyzer._to_float(row.get('open', 0.0))
@@ -252,7 +281,7 @@ class PortfolioBacktester:
                             else:
                                 positions[ticker] = {
                                     'qty': target_qty, 'entry_p': exec_price, 
-                                    'highest_close': exec_price, 
+                                    'high_p': exec_price, 
                                     'atr_mult': order['atr_mult'],
                                     'took_2r': False, 'took_3r': False, 'days_held': 0
                                 }
@@ -271,89 +300,89 @@ class PortfolioBacktester:
                 vol_ratio = AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 1.0))
                 
                 pos['days_held'] += 1
-                pos['highest_close'] = max(pos['highest_close'], curr_c)
+                pos['high_p'] = max(pos['high_p'], curr_c)
                 
-                ch_stop = max(pos['highest_close'] - (current_atr * pos['atr_mult']), pos['entry_p'] - (current_atr * pos['atr_mult']))
+                ch_stop = max(pos['high_p'] - (current_atr * pos['atr_mult']), pos['entry_p'] - (current_atr * pos['atr_mult']))
                 
                 exit_score = 0
                 if bool(row.get('bb_3_reversal', False)): exit_score += 40
                 if curr_c < ch_stop: exit_score += 100 
-                if dev25_val > 20.0 and rsi_val > 85.0 and vol_ratio >= 2.0: exit_score += 100 
+                if dev25_val > 20.0 and rsi_val > 85.0 and vol_ratio > 2.0: exit_score += 100 
                 if pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.02): exit_score += 100 
+                
+                if current_atr > 0 and curr_c > pos['entry_p']:
+                    r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
+                    if r_mult >= 3.0 and not pos['took_3r']:
+                        sell_qty = int(pos['qty'] // 2)
+                        if sell_qty > 0:
+                            cash += sell_qty * curr_c
+                            pos['qty'] -= sell_qty
+                            total_trades += 1
+                            pos['took_3r'] = True
+                            pos['took_2r'] = True
+                    elif r_mult >= 2.0 and not pos['took_2r']:
+                        sell_qty = int(pos['qty'] // 3)
+                        if sell_qty > 0:
+                            cash += sell_qty * curr_c
+                            pos['qty'] -= sell_qty
+                            total_trades += 1
+                            pos['took_2r'] = True
+                                
                 if bool(row.get('bb_p1_cross_down', False)): exit_score += 20
                 if AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0)) and vol_ratio >= 1.0: exit_score += 15
                 if AdvancedStrategyAnalyzer._to_float(row.get('macd', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('sig', 0)) and vol_ratio >= 1.0: exit_score += 15
+                if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: exit_score += 5
                 
                 if exit_score >= 80:
                     cash += pos['qty'] * curr_c
                     total_trades += 1
                     closed_tickers.append(ticker)
-                else:
-                    if current_atr > 0 and curr_c > pos['entry_p']:
-                        r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
-                        if r_mult >= 3.0 and not pos['took_3r']:
-                            sell_qty = int(pos['qty'] // 2)
-                            if sell_qty > 0:
-                                cash += sell_qty * curr_c
-                                pos['qty'] -= sell_qty
-                                total_trades += 1
-                                pos['took_3r'] = True
-                                pos['took_2r'] = True
-                        elif r_mult >= 2.0 and not pos['took_2r']:
-                            sell_qty = int(pos['qty'] // 3)
-                            if sell_qty > 0:
-                                cash += sell_qty * curr_c
-                                pos['qty'] -= sell_qty
-                                total_trades += 1
-                                pos['took_2r'] = True
                                 
             for ct in closed_tickers: del positions[ct]
 
-            # 3. エントリー候補の探索と動的資金管理
+            # 3. エントリー候補の探索と動的資金管理 (スロット制限の適用)
             current_equity = self._calculate_total_equity(today_market, positions)
-            available_cash = cash
+            open_slots = self.max_positions - len(positions)
             
-            if vix >= 30.0:
-                available_cash = 0.0
-
-            if available_cash > 0:
+            if open_slots > 0 and cash > 0:
                 candidates = []
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
-                    is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(row)
+                    is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(row, "スイング", n_chg, vix)
                     if is_entry:
-                        limit_p, atr_mult = AdvancedStrategyAnalyzer.get_order_params(row)
+                        limit_p, atr_mult = AdvancedStrategyAnalyzer.get_order_params(row, n_chg)
                         candidates.append((score, ticker, limit_p, atr_mult, row))
                 
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 
-                for score, ticker, limit_p, atr_mult, row in candidates:
-                    if available_cash <= 0: break
-                    
+                for score, ticker, limit_p, atr_mult, row in candidates[:open_slots]:
                     atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 0.0))
                     if atr <= 0: continue
                         
                     stop_loss = limit_p - (atr * atr_mult)
                     diff = max(0.1, limit_p - stop_loss) 
                     
+                    # 資金管理ロジック (口座の1%リスク許容度)
                     risk_fund = current_equity * 0.01
                     raw_shares = int((risk_fund / diff) // 100 * 100)
                     
-                    max_alloc = current_equity * 0.20
+                    # 単元スロットベースでの最大投資枠制限 (10スロットなら総資金の10%上限)
+                    max_alloc = current_equity / self.max_positions
                     max_shares = int((max_alloc / limit_p) // 100 * 100)
                     
                     target_qty = min(raw_shares, max_shares)
                     
                     if target_qty >= 100:
                         required_cash = target_qty * limit_p
-                        if available_cash >= required_cash:
+                        if cash >= required_cash:
                             pending_orders.append({
                                 'ticker': ticker, 
                                 'limit_price': limit_p, 
                                 'atr_mult': atr_mult,
                                 'qty': target_qty
                             })
-                            available_cash -= required_cash
+                            # 見込み現金を減らして過剰注文を防ぐ
+                            cash -= required_cash
 
             self.cash = cash 
             equity_curve.append(current_equity)
@@ -386,24 +415,28 @@ def run_integrity_tests() -> None:
     df_empty = pd.DataFrame()
     assert AdvancedStrategyAnalyzer.calculate_indicators(df_empty).empty, "Empty DataFrame should return empty"
     
-    try: AdvancedStrategyAnalyzer.evaluate_entry("invalid_type") # type: ignore
+    try: AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0) # type: ignore
     except TypeError: pass
     else: assert False, "Type checking failed on evaluate_entry"
+
+    # マクロフィルターテスト
+    dummy_bear_market = {'close_bm': 1800.0, 'bm_ma200': 2000.0, 'close': 1000.0}
+    is_entry, _ = AdvancedStrategyAnalyzer.evaluate_entry(dummy_bear_market, "スイング", 0.0, 15.0)
+    assert not is_entry, "Should block entry in bear market (close_bm < bm_ma200)"
 
     dummy_large = {'close': 1000.0, 'atr': 50.0, 'mcap': 1000.0}
     dummy_small = {'close': 1000.0, 'atr': 50.0, 'mcap': 300.0}
     
-    limit_l, atr_l = AdvancedStrategyAnalyzer.get_order_params(dummy_large)
-    limit_s, atr_s = AdvancedStrategyAnalyzer.get_order_params(dummy_small)
+    limit_l, atr_l = AdvancedStrategyAnalyzer.get_order_params(dummy_large, 0.0)
+    limit_s, atr_s = AdvancedStrategyAnalyzer.get_order_params(dummy_small, 0.0)
     
     assert limit_s < limit_l, "Small cap limit price must be deeper"
     assert atr_s > atr_l, "Small cap ATR multiplier must be wider"
 
-    # [改修] FileNotFoundError回避のため一時ディレクトリを作成して検証
     test_dir = "dummy_test_dir_for_integrity"
     os.makedirs(test_dir, exist_ok=True)
     try:
-        tester = PortfolioBacktester(data_dir=test_dir, initial_cash=1000000.0)
+        tester = PortfolioBacktester(data_dir=test_dir, initial_cash=1000000.0, max_positions=10)
         mock_market = {'9999': {'close': 1500.0}}
         mock_positions = {'9999': {'qty': 100, 'entry_p': 1000.0}}
         equity = tester._calculate_total_equity(mock_market, mock_positions)
@@ -421,14 +454,18 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"Directory '{data_dir}' not found. Please run data_fetcher.py first.")
             
         print("\n==================================================")
-        print(" 🚀 STARTING FULL UNIVERSE CROSS-SECTIONAL BACKTEST (VER.3.1)")
+        print(" 🚀 STARTING HYBRID OPTIMIZED BACKTEST (VER.4.0)")
         print("==================================================")
         
-        tester = PortfolioBacktester(data_dir=data_dir, initial_cash=1000000.0)
+        # 最大保有スロットを10に設定（連鎖被弾リスクの遮断）
+        STARTING_CAPITAL = 1000000.0
+        MAX_CONCURRENT_POSITIONS = 10
+        
+        tester = PortfolioBacktester(data_dir=data_dir, initial_cash=STARTING_CAPITAL, max_positions=MAX_CONCURRENT_POSITIONS)
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (FULL UNIVERSE)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (HYBRID OPTIMIZED)")
         print(f"==================================================")
         print(f" ▶ 初期資金 : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 : ¥{int(res['Final_Cash']):,}")
