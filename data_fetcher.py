@@ -7,7 +7,9 @@ from typing import Dict, List, Optional, Final, Any
 from datetime import datetime, timedelta
 
 # ==========================================
-# J-Quants API v2 エンドポイント設定
+# 2025-2026年 最新公式ドキュメント準拠
+# Pandas: https://pandas.pydata.org/docs/
+# Requests: https://requests.readthedocs.io/en/latest/
 # ==========================================
 BASE_URL: Final[str] = "https://api.jquants.com/v2"
 EP_DAILY: Final[str] = "/equities/bars/daily"
@@ -217,6 +219,7 @@ if __name__ == "__main__":
     if not key: raise ValueError("[FATAL] JQUANTS_API_KEY is not set.")
     
     fetcher = JQuantsV2Fetcher(key)
+    # GitHub用フォルダ等の指定がある場合は適宜パスを変更可能ですが、今回は既存の data/ に出力します
     os.makedirs("data", exist_ok=True)
     
     target_tickers = fetcher.get_top_tickers()
@@ -224,7 +227,6 @@ if __name__ == "__main__":
         
     print(f"[INFO] Starting combined data fetch (Daily + Margin + Fins) for {len(target_tickers)} tickers...")
     
-    # --- 【修正完了】テスト用のスライス `[:5]` を削除し、全銘柄をダウンロードします ---
     for i, target_ticker in enumerate(target_tickers):
         print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ")
         fetched_data = fetcher.fetch(target_ticker)
