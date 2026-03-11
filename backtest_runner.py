@@ -44,7 +44,7 @@ class AdvancedStrategyAnalyzer:
             missing = required_cols - set(df.columns)
             raise KeyError(f"DataFrameに必須列が不足しています: {missing}")
 
-        # 基本指標
+        # --- 基本指標の算出 ---
         df['prev_close'] = df['close'].shift(1)
         df['prev_low'] = df['low'].shift(1)
         df['ma5'] = df['close'].rolling(window=5).mean()
@@ -55,7 +55,7 @@ class AdvancedStrategyAnalyzer:
         df['ma75'] = df['close'].rolling(window=75).mean()
         df['ma200'] = df['close'].rolling(window=200).mean()
         
-        # ボリンジャーバンド & 反転サイン
+        # --- ボリンジャーバンド & 反転サイン ---
         df['bb_up_3'] = df['ma20'] + (df['std20'] * 3)
         df['bb_p1'] = df['ma20'] + df['std20'] 
         df['bb_width'] = np.where(df['ma20'] > 0, (df['std20'] * 4) / df['ma20'], 0)
@@ -66,7 +66,7 @@ class AdvancedStrategyAnalyzer:
         df['was_above_bb_up_3'] = (df['high'] >= df['bb_up_3']).rolling(window=3).max() > 0
         df['bb_3_reversal'] = df['was_above_bb_up_3'] & ((df['close'] < df['prev_low']) | (df['close'] < df['open']))
 
-        # オシレーター (MACD & RSI)
+        # --- オシレーター (MACD & RSI) ---
         df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
         df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = df['ema12'] - df['ema26']
@@ -79,12 +79,16 @@ class AdvancedStrategyAnalyzer:
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
         df['rsi_slope'] = df['rsi'] - df['rsi'].shift(5)
         
-        # ボラティリティ & 出来高
-        tr = pd.concat([(df['high'] - df['low']), (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
+        # --- ボラティリティ & 出来高 ---
+        tr = pd.concat([
+            (df['high'] - df['low']), 
+            (df['high'] - df['close'].shift()).abs(), 
+            (df['low'] - df['close'].shift()).abs()
+        ], axis=1).max(axis=1)
         df['atr'] = tr.rolling(window=14).mean() 
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
 
-        # ベンチマーク(TOPIX 200MA) フィルター用マージ
+        # --- ベンチマーク(TOPIX 200MA) フィルター用マージ ---
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             benchmark_df['bm_ma200'] = benchmark_df['close'].rolling(window=200).mean()
@@ -104,7 +108,7 @@ class AdvancedStrategyAnalyzer:
         """
         マクロ・テクニカル・需給を複合判定しエントリー可否を返す
         """
-        # 1. 強力なマクロフィルター (TOPIX 200MA)
+        # 1. 強力なマクロフィルター (TOPIX 200MA) - 防御の要
         bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
         bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
         if bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200:
@@ -128,24 +132,25 @@ class AdvancedStrategyAnalyzer:
         mr_zscore = AdvancedStrategyAnalyzer._to_float(row_dict.get('mr_zscore', 0.0))
         is_small_cap = 0.0 < mcap < 500.0 if mcap > 0 else False
 
-        # 2. 小型株の需給・乖離フィルター
+        # 2. 小型株の需給悪化・異常乖離ネガティブカット
         if is_small_cap and (mr_zscore >= 1.0 or dev25_val <= -20.0):
             return False, 0.0
 
-        # 3. スコアリング
+        # 3. スコアリング (実戦的な重み付け)
         score = 0.0
         if vol_ratio >= 1.5: score += 40
         if 40 <= rsi_val <= 70: score += 20
         if rsi_val < 30.0 and is_bullish: score += 50 # 逆張り反発期待
         if rs_21_val > 0: score += 20 # 相対的強さ
-        if bb_width <= 0.15: score += 15 # スクイーズ
+        if bb_width <= 0.15: score += 15 # スクイーズ（ボラティリティの収束）
         
         score += 30 # ベース加点
         
+        # ペナルティ設定
         tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
         total_score = (score * 0.7) - tech_penalty 
         
-        # エントリー閾値
+        # エントリー閾値判定
         is_entry = (total_score >= 85 and rs_21_val > 0)
         return is_entry, float(total_score)
 
@@ -161,7 +166,7 @@ class AdvancedStrategyAnalyzer:
         is_small_cap = 0.0 < mcap < 500.0 if mcap > 0 else False
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
         
-        # 小型株は深い押し目を狙い、損切も広く
+        # 小型株は深い押し目を狙い、損切幅（ATR倍数）も広く取る
         if is_small_cap:
             base_offset = 0.8
             atr_mult = 2.5 
@@ -219,6 +224,7 @@ class PortfolioBacktester:
         bm_df = pd.read_parquet(bm_path) if os.path.exists(bm_path) else None
         if bm_df is None: diag_print("⚠️ WARNING: 13060.parquet (TOPIX) not found. Macro filter will be inactive.")
 
+        # --- データのロードとタイムライン構築 ---
         dates_set = set()
         for i, file in enumerate(files):
             df = pd.read_parquet(os.path.join(data_dir, file))
@@ -252,25 +258,29 @@ class PortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
-            # 1. 前日の予約注文の約定処理
+            # --- 1. 前日の予約注文の約定処理 ---
             new_pending = []
             for order in pending_orders:
                 ticker = order['ticker']
                 if ticker in today_market and len(positions) < self.max_positions:
                     row = today_market[ticker]
-                    if AdvancedStrategyAnalyzer._to_float(row.get('low', 0)) <= order['limit_price']:
-                        exec_p = min(AdvancedStrategyAnalyzer._to_float(row.get('open', 0)), order['limit_price'])
+                    low_p = AdvancedStrategyAnalyzer._to_float(row.get('low', 0))
+                    open_p = AdvancedStrategyAnalyzer._to_float(row.get('open', 0))
+                    
+                    if low_p <= order['limit_price']:
+                        exec_p = min(open_p, order['limit_price'])
                         qty = order['qty']
-                        if self.cash >= (qty * exec_p):
-                            self.cash -= qty * exec_p
+                        required_cash = qty * exec_p
+                        if self.cash >= required_cash:
+                            self.cash -= required_cash
                             positions[ticker] = {
                                 'qty': qty, 'entry_p': exec_p, 'high_p': exec_p, 
                                 'atr_mult': order['atr_mult'], 'days_held': 0,
                                 'took_2r': False, 'took_3r': False
                             }
-            pending_orders = []
+            pending_orders = [] # 当日の注文は翌朝処理
 
-            # 2. エグジット判定 (Chandelier & Time stop)
+            # --- 2. エグジット判定 (Chandelier & Time stop & R-Multi) ---
             closed = []
             for t, p in positions.items():
                 if t not in today_market: continue
@@ -281,7 +291,7 @@ class PortfolioBacktester:
                 p['days_held'] += 1
                 p['high_p'] = max(p['high_p'], curr_c)
                 
-                # 損切ライン (シャンデリアストップ)
+                # 損切ライン (シャンデリアストップ：高値または買値からATRの一定倍率下落)
                 stop_line = max(p['high_p'] - (atr * p['atr_mult']), p['entry_p'] - (atr * p['atr_mult']))
                 
                 if curr_c < stop_line or p['days_held'] >= 10:
@@ -289,9 +299,9 @@ class PortfolioBacktester:
                     total_trades += 1
                     closed.append(t)
                 else:
-                    # 部分利確 (R倍数ベース)
+                    # 部分利確ロジック (R倍数ベース)
                     if atr > 0:
-                        r_mult = (curr_c - p['entry_p']) / (atr * 2)
+                        r_mult = (curr_c - p['entry_p']) / (atr * 2) # リスク単位をATR*2と仮定
                         if r_mult >= 3.0 and not p['took_3r']:
                             sell_qty = int(p['qty'] // 2)
                             if sell_qty > 0:
@@ -309,8 +319,12 @@ class PortfolioBacktester:
                                 
             for t in closed: del positions[t]
 
-            # 3. 新規エントリー探索
-            current_equity = self.cash + sum(p['qty'] * AdvancedStrategyAnalyzer._to_float(today_market[t].get('close', p['entry_p'])) for t, p in positions.items() if t in today_market)
+            # --- 3. 新規エントリー探索と動的資金管理 ---
+            # 建玉の時価評価額を含めた現在の総資産
+            current_equity = self.cash + sum(
+                p['qty'] * AdvancedStrategyAnalyzer._to_float(today_market[t].get('close', p['entry_p'])) 
+                for t, p in positions.items() if t in today_market
+            )
             
             open_slots = self.max_positions - len(positions)
             if open_slots > 0:
@@ -323,26 +337,36 @@ class PortfolioBacktester:
                             candidates.append((score, t, lp, am, row))
                 
                 candidates.sort(key=lambda x: x[0], reverse=True)
+                
                 for score, ticker, lp, am, row in candidates[:open_slots]:
-                    # 1%リスク許容度に基づく枚数計算
+                    # 1%リスク許容度に基づく枚数計算 (Deep Analyzer準拠)
                     atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 1.0))
                     risk_per_share = max(0.1, lp - (lp - atr * am))
                     risk_fund = current_equity * 0.01
                     raw_shares = int((risk_fund / risk_per_share) // 100 * 100)
                     
-                    # スロットあたりの最大投資額 (10%)
-                    max_shares = int(((current_equity * 0.1) / lp) // 100 * 100)
+                    # 1銘柄あたりの最大投資枠制限 (スロット均等割：10%)
+                    max_alloc = current_equity / self.max_positions
+                    max_shares = int((max_alloc / lp) // 100 * 100)
+                    
                     qty = min(raw_shares, max_shares)
                     
                     if qty >= 100 and self.cash >= (qty * lp):
-                        pending_orders.append({'ticker': ticker, 'limit_price': lp, 'atr_mult': am, 'qty': qty})
+                        pending_orders.append({
+                            'ticker': ticker, 
+                            'limit_price': lp, 
+                            'atr_mult': am, 
+                            'qty': qty
+                        })
             
             equity_curve.append(current_equity)
-            if (i+1) % 500 == 0: diag_print(f"Simulation progress: Day {i+1}/{len(self.sorted_dates)} | Equity: ¥{int(current_equity):,}")
+            if (i+1) % 500 == 0: 
+                diag_print(f"Simulation progress: Day {i+1}/{len(self.sorted_dates)} | Equity: ¥{int(current_equity):,}")
 
-        # 結果集計
+        # --- 結果集計 ---
         eq_series = pd.Series(equity_curve)
-        if eq_series.empty: return {"Initial": self.initial_cash, "Final": self.initial_cash, "Return": 0, "MDD": 0, "Trades": 0}
+        if eq_series.empty: 
+            return {"Initial": self.initial_cash, "Final": self.initial_cash, "Return": 0, "MDD": 0, "Trades": 0}
         
         mdd = (eq_series - eq_series.cummax()) / eq_series.cummax()
         return {
@@ -359,26 +383,28 @@ class PortfolioBacktester:
 def run_integrity_tests() -> None:
     diag_print("Running integrity tests...")
     
-    # 小型株の指値ロジックチェック
+    # 1. 指値ロジックの妥当性チェック
     dummy_small = {'close': 1000.0, 'atr': 50.0, 'mcap': 300.0}
     dummy_large = {'close': 1000.0, 'atr': 50.0, 'mcap': 1000.0}
-    lp_s, _ = AdvancedStrategyAnalyzer.get_order_params(dummy_small, 0.0)
-    lp_l, _ = AdvancedStrategyAnalyzer.get_order_params(dummy_large, 0.0)
-    assert lp_s < lp_l, "Diagnostic fail: Small cap limit price should be deeper than large cap."
+    lp_s, am_s = AdvancedStrategyAnalyzer.get_order_params(dummy_small, 0.0)
+    lp_l, am_l = AdvancedStrategyAnalyzer.get_order_params(dummy_large, 0.0)
+    assert lp_s < lp_l, "Diagnostic fail: Small cap limit price should be deeper."
+    assert am_s > am_l, "Diagnostic fail: Small cap ATR mult should be wider."
     
-    # 200MAフィルターチェック
-    bear_row = {'close_bm': 190.0, 'bm_ma200': 200.0, 'close': 100.0, 'rsi': 25.0}
+    # 2. マクロフィルター(TOPIX 200MA)の動作チェック
+    bear_row = {'close_bm': 190.0, 'bm_ma200': 200.0, 'close': 100.0, 'rsi': 25.0, 'rs_21': 5.0}
     ok, _ = AdvancedStrategyAnalyzer.evaluate_entry(bear_row, 0.0, 15.0)
-    assert not ok, "Diagnostic fail: Entry should be blocked in bear market (TOPIX < 200MA)."
+    assert not ok, "Diagnostic fail: Entry must be blocked in bear market."
 
     diag_print("All integrity tests passed.")
 
 if __name__ == "__main__":
-    diag_print("--- STARTING BACKTEST Runner Ver.4.1 (FULL) ---")
+    diag_print("--- STARTING HYBRID BACKTEST Runner Ver.4.1 (FULL) ---")
     run_integrity_tests()
     
     try:
         data_path = "data"
+        # スロット制（10銘柄）を導入し、分散とリスク管理を強化
         tester = PortfolioBacktester(data_dir=data_path, initial_cash=1000000.0, max_positions=10)
         results = tester.run()
         
