@@ -5,10 +5,6 @@ import yfinance as yf
 from typing import Dict, List, Any, Optional, Final, Tuple
 from datetime import datetime, timedelta
 
-# 公式ドキュメント準拠: 
-# Pandas (https://pandas.pydata.org/docs/)
-# yfinance (https://yfinance.readthedocs.io/en/latest/)
-
 def debug_log(msg: str) -> None:
     """内部デバッグ用のロギング関数"""
     if not isinstance(msg, str): raise TypeError("msg must be a string")
@@ -240,7 +236,6 @@ class PortfolioBacktester:
                     limit_p = order['limit_price']
                     target_qty = order['qty']
                     
-                    # 注文が刺さり、かつ現金が足りる場合のみ約定
                     if low_p <= limit_p:
                         exec_price = min(open_p, limit_p)
                         required_cash = target_qty * exec_price
@@ -248,7 +243,6 @@ class PortfolioBacktester:
                         if target_qty > 0 and cash >= required_cash:
                             cash -= required_cash
                             if ticker in positions:
-                                # 買い増し（平均取得単価の更新）
                                 old_qty = positions[ticker]['qty']
                                 old_entry = positions[ticker]['entry_p']
                                 new_qty = old_qty + target_qty
@@ -256,7 +250,6 @@ class PortfolioBacktester:
                                 positions[ticker]['qty'] = new_qty
                                 positions[ticker]['entry_p'] = new_entry
                             else:
-                                # 新規エントリー
                                 positions[ticker] = {
                                     'qty': target_qty, 'entry_p': exec_price, 
                                     'highest_close': exec_price, 
@@ -316,11 +309,10 @@ class PortfolioBacktester:
                                 
             for ct in closed_tickers: del positions[ct]
 
-            # 3. エントリー候補の探索と動的資金管理 (スロット制限撤廃)
+            # 3. エントリー候補の探索と動的資金管理
             current_equity = self._calculate_total_equity(today_market, positions)
             available_cash = cash
             
-            # VIX急騰時は新規買いを見送り（Kill Switch）
             if vix >= 30.0:
                 available_cash = 0.0
 
@@ -333,28 +325,23 @@ class PortfolioBacktester:
                         limit_p, atr_mult = AdvancedStrategyAnalyzer.get_order_params(row)
                         candidates.append((score, ticker, limit_p, atr_mult, row))
                 
-                # スコア順にソートして上から処理
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 
                 for score, ticker, limit_p, atr_mult, row in candidates:
                     if available_cash <= 0: break
                     
-                    # 資金管理ロジック (deep_analyzer.py準拠)
                     atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 0.0))
                     if atr <= 0: continue
                         
                     stop_loss = limit_p - (atr * atr_mult)
-                    diff = max(0.1, limit_p - stop_loss) # ゼロ割回避
+                    diff = max(0.1, limit_p - stop_loss) 
                     
-                    # リスク許容度に基づく計算 (総資金の1%を最大損失とする)
                     risk_fund = current_equity * 0.01
                     raw_shares = int((risk_fund / diff) // 100 * 100)
                     
-                    # 1銘柄あたりの最大投資枠 (総資金の20%)
                     max_alloc = current_equity * 0.20
                     max_shares = int((max_alloc / limit_p) // 100 * 100)
                     
-                    # 単元株(100株)丸め
                     target_qty = min(raw_shares, max_shares)
                     
                     if target_qty >= 100:
@@ -368,8 +355,7 @@ class PortfolioBacktester:
                             })
                             available_cash -= required_cash
 
-            # 資産曲線の記録
-            self.cash = cash # 状態の更新
+            self.cash = cash 
             equity_curve.append(current_equity)
 
         final_equity = equity_curve[-1] if equity_curve else self.initial_cash
@@ -413,11 +399,17 @@ def run_integrity_tests() -> None:
     assert limit_s < limit_l, "Small cap limit price must be deeper"
     assert atr_s > atr_l, "Small cap ATR multiplier must be wider"
 
-    tester = PortfolioBacktester(data_dir="dummy", initial_cash=1000000.0)
-    mock_market = {'9999': {'close': 1500.0}}
-    mock_positions = {'9999': {'qty': 100, 'entry_p': 1000.0}}
-    equity = tester._calculate_total_equity(mock_market, mock_positions)
-    assert equity == 1000000.0 + (100 * 1500.0), "Equity calculation failed"
+    # [改修] FileNotFoundError回避のため一時ディレクトリを作成して検証
+    test_dir = "dummy_test_dir_for_integrity"
+    os.makedirs(test_dir, exist_ok=True)
+    try:
+        tester = PortfolioBacktester(data_dir=test_dir, initial_cash=1000000.0)
+        mock_market = {'9999': {'close': 1500.0}}
+        mock_positions = {'9999': {'qty': 100, 'entry_p': 1000.0}}
+        equity = tester._calculate_total_equity(mock_market, mock_positions)
+        assert equity == 1000000.0 + (100 * 1500.0), "Equity calculation failed"
+    finally:
+        os.rmdir(test_dir)
 
     debug_log("All integrity tests passed.")
 
@@ -429,7 +421,7 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"Directory '{data_dir}' not found. Please run data_fetcher.py first.")
             
         print("\n==================================================")
-        print(" 🚀 STARTING FULL UNIVERSE CROSS-SECTIONAL BACKTEST (VER.3)")
+        print(" 🚀 STARTING FULL UNIVERSE CROSS-SECTIONAL BACKTEST (VER.3.1)")
         print("==================================================")
         
         tester = PortfolioBacktester(data_dir=data_dir, initial_cash=1000000.0)
