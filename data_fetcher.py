@@ -223,7 +223,9 @@ if __name__ == "__main__":
     if "13060" not in target_tickers: target_tickers.append("13060")
         
     print(f"[INFO] Starting combined data fetch (Daily + Margin + Fins) for {len(target_tickers)} tickers...")
-    for i, target_ticker in enumerate(target_tickers[:5]): # テスト時は絞り込みを推奨
+    
+    # --- 【修正完了】テスト用のスライス `[:5]` を削除し、全銘柄をダウンロードします ---
+    for i, target_ticker in enumerate(target_tickers):
         print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ")
         fetched_data = fetcher.fetch(target_ticker)
         if not fetched_data.empty:
