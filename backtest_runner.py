@@ -120,11 +120,12 @@ class AdvancedStrategyAnalyzer:
         is_small_cap = 0 < mcap < 500.0
 
         # --- マクロ防衛線 (Kill Switch) ---
+        # 5日間の下落率に変更したため、しきい値を真のショックレベル(-3.0%)に設定
         bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
         bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
         
-        if (jpy_chg <= -1.0) or (n_chg <= -2.0) or (is_bear_market and vix >= 20.0):
+        if (jpy_chg <= -3.0) or (n_chg <= -4.0) or (is_bear_market and vix >= 20.0):
             return False, 0.0, is_small_cap
 
         # --- deep_analyzer同期のネガティブカット ---
@@ -169,10 +170,10 @@ class AdvancedStrategyAnalyzer:
             if 0 < dev25_val <= 20: main_score += 15
             elif dev25_val > 20: main_score += 5
             
-            # deep_analyzer同期ボーナス＆ペナルティ
+            # 【修正】小型株のボーナス条件を緩和（AND条件からOR条件へ）
             if rsi_val < 30.0 and is_bullish:
                 if is_small_cap:
-                    if is_macd_improving and vol_ratio >= 1.5: main_score += 50.0
+                    if is_macd_improving or vol_ratio >= 1.5: main_score += 50.0
                 else:
                     main_score += 50.0 
             main_score += 30 
@@ -189,16 +190,16 @@ class AdvancedStrategyAnalyzer:
 
     @staticmethod
     def calculate_limit_price(row_dict: Dict[str, Any], attr: str, n_chg: float, is_small_cap: bool) -> float:
-        """deep_analyzer同期の深い指値ロジック"""
+        """【修正】過剰に深い指値を浅くし、健全な日中の押し目で拾えるように適正化"""
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be dict")
             
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
         
-        # 小型株は深い指値(ATR*1.0)を採用。大型は確実性重視(ATR*0.1)
-        base_offset = 1.0 if is_small_cap else 0.1
-        if attr == "押し目": base_offset = 2.0 if is_small_cap else 0.3
+        # 小型株: 1.0(ダマシ) -> 0.4(適正) / 大型株: 0.1(高値掴み) -> 0.3(適正)
+        base_offset = 0.4 if is_small_cap else 0.3
+        if attr == "押し目": base_offset = 0.6 if is_small_cap else 0.5
         
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price))
@@ -215,9 +216,10 @@ class USMarketCache:
             usdjpy = yf.Ticker("USDJPY=X").history(period="10y")
             
             if not ndx.empty and not vix.empty and not usdjpy.empty:
-                self.ndx = ndx['Close'].pct_change() * 100
+                # 【修正】単日ではなく「5日間の変化率」で判定し、日常的なノイズを除去
+                self.ndx = ndx['Close'].pct_change(5) * 100
                 self.vix = vix['Close']
-                self.jpy = usdjpy['Close'].pct_change() * 100
+                self.jpy = usdjpy['Close'].pct_change(5) * 100
                 
                 self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
                 self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
@@ -246,7 +248,6 @@ class PortfolioBacktester:
         self.us_market = USMarketCache()
         self.timeline: Dict[str, Dict[str, Dict[str, Any]]] = {}
         
-        # バックテスト検証項目用ログデータ
         self.stats = {
             'limit_placed_small': 0, 'limit_exec_small': 0,
             'limit_placed_large': 0, 'limit_exec_large': 0,
@@ -288,17 +289,17 @@ class PortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix, jpy_chg = self.us_market.get_state(date_str)
             
-            # マクロキルスイッチの判定
             is_bear_market = False
             if '13060' in today_market:
                 bm_c = AdvancedStrategyAnalyzer._to_float(today_market['13060'].get('close', 0))
                 bm_m200 = AdvancedStrategyAnalyzer._to_float(today_market['13060'].get('bm_ma200', 0))
                 is_bear_market = (bm_c > 0 and bm_m200 > 0 and bm_c < bm_m200)
                 
-            is_kill_switch = (jpy_chg <= -1.0) or (n_chg <= -2.0) or (is_bear_market and vix >= 20.0)
+            # マクロキルスイッチの判定（5日変化率に変更済み）
+            is_kill_switch = (jpy_chg <= -3.0) or (n_chg <= -4.0) or (is_bear_market and vix >= 20.0)
             if is_kill_switch: self.stats['kill_switch_days'] += 1
             
-            # 1. 約定判定（深い指値の検証）
+            # 1. 約定判定
             unfilled_orders = []
             for order in pending_orders:
                 t = order['ticker']
@@ -333,13 +334,12 @@ class PortfolioBacktester:
                 p['days_held'] += 1
                 p['high_p'] = max(p['high_p'], curr_c)
                 
-                # exit_strategy 同期: クライマックス売り
                 is_climax = False
                 if p['is_sc'] and dev25 > 50.0 and rsi > 90.0 and vol_ratio >= 3.0: is_climax = True
                 elif not p['is_sc'] and dev25 > 20.0 and rsi > 85.0 and vol_ratio >= 2.0: is_climax = True
                 
-                # exit_strategy 同期: タイムストップ
-                time_stop_days = 20 if p['is_sc'] else 10
+                # 【修正】大型株のタイムストップを10日から15日に少しだけ延長
+                time_stop_days = 20 if p['is_sc'] else 15
                 is_time_stop = (p['days_held'] >= time_stop_days and curr_c < (p['entry_p'] * 1.02))
                 
                 atr_mult = 3.5 if p['is_sc'] else 2.5
@@ -405,16 +405,14 @@ class PortfolioBacktester:
 # ==========================================
 def run_integrity_tests() -> None:
     diag_print("Running integrity tests...")
-    # 1. 空DF
     assert AdvancedStrategyAnalyzer.calculate_indicators(pd.DataFrame()).empty
-    # 2. 不正な型への耐性
     try: 
         AdvancedStrategyAnalyzer.evaluate_entry("invalid", "スイング", 0.0, 15.0, 0.0) # type: ignore
         assert False, "Should raise TypeError"
     except TypeError: pass
     
-    # 3. 小型株のフィルター動作検証
-    row_small = {'mcap': 300.0, 'close_bm': 210, 'bm_ma200': 200, 'mr_zscore': 1.5} # しこり異常
+    # 小型株のフィルター動作検証（緩和後の動作確認）
+    row_small = {'mcap': 300.0, 'close_bm': 210, 'bm_ma200': 200, 'mr_zscore': 1.5}
     ok, _, is_sc = AdvancedStrategyAnalyzer.evaluate_entry(row_small, "スイング", 0.0, 15.0, 0.0)
     assert is_sc is True, "Small cap flag failed"
     assert ok is False, "Z-score cutoff for small cap failed"
@@ -425,10 +423,9 @@ if __name__ == "__main__":
     run_integrity_tests()
     try:
         results = PortfolioBacktester(data_dir="data", max_positions=5).run()
-        print(f"\n==================================================\n 📊 RESULTS (Deep Analyzer Synchronized Ver.)\n==================================================")
+        print(f"\n==================================================\n 📊 RESULTS (Deep Analyzer Synchronized Ver. FIXED)\n==================================================")
         print(f" ▶ 初期資金 : ¥{int(results['Initial']):,}\n ▶ 最終資産 : ¥{int(results['Final']):,}\n ▶ 総利回り : {results['Return']:.2%}\n ▶ 最大下落 : {results['MDD']:.2%}\n ▶ 取引回数 : {results['Trades']} 回")
         
-        # 検証項目レポート出力
         st = results['Stats']
         sm_rate = (st['limit_exec_small'] / st['limit_placed_small']) * 100 if st['limit_placed_small'] > 0 else 0
         lg_rate = (st['limit_exec_large'] / st['limit_placed_large']) * 100 if st['limit_placed_large'] > 0 else 0
@@ -436,13 +433,13 @@ if __name__ == "__main__":
         
         print(f"==================================================")
         print(f" 🔬 アドバイザリー検証レポート")
-        print(f" [1] 深い指値の約定率 (小型株ダマシ回避検証)")
+        print(f" [1] 深い指値の約定率 (最適化後)")
         print(f"     - 小型株(深め) : {st['limit_exec_small']}/{st['limit_placed_small']} ({sm_rate:.1f}%)")
         print(f"     - 大型株(浅め) : {st['limit_exec_large']}/{st['limit_placed_large']} ({lg_rate:.1f}%)")
-        print(f" [2] タイムストップと小型株の握力 (20日 vs 10日)")
+        print(f" [2] タイムストップと小型株の握力 (20日 vs 15日)")
         print(f"     - 小型特例発動回数 : {st['ts_small']} 回 (うち微益撤退: {ts_sm_win_rate:.1f}%)")
         print(f"     - 大型通常発動回数 : {st['ts_large']} 回")
-        print(f" [3] マクロ・キルスイッチ有効性")
+        print(f" [3] マクロ・キルスイッチ有効性 (5日間変化率基準)")
         print(f"     - 稼働日数 : {st['kill_switch_days']} 日")
         print(f"     - 回避した危険なエントリー数 : {st['kill_switch_avoids']} 回")
         print(f"==================================================", flush=True)
