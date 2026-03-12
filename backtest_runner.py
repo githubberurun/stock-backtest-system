@@ -43,7 +43,7 @@ class AdvancedStrategyAnalyzer:
             missing = required_cols - set(df.columns)
             raise KeyError(f"DataFrameに必須列が不足しています: {missing}")
 
-        # === 600%実績コードと完全同一の指標計算 ===
+        # === 600%実績コードと完全に同一の指標群 ===
         df['prev_close'] = df['close'].shift(1)
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
@@ -110,99 +110,92 @@ class AdvancedStrategyAnalyzer:
         ma25_turnover = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma25_turnover', 0.0))
         is_small_cap = (0 < mcap < 500.0) or (mcap == 0.0 and 0 < ma25_turnover < 500_000_000)
 
+        bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
+        bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
+        if bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200:
+            return False, 0.0, is_small_cap  
+        
+        if n_chg <= -2.0 or vix >= 20.0: return False, 0.0, is_small_cap
+        
+        curr_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
+        prev_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('prev_close', 0.0))
+        rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0), 50.0)
+        dev25_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0), 0.0)
+        rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0), 0.0)
+        vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
+        
+        m25 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma25', 0.0))
+        m75 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma75', 0.0))
+        m200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma200', 0.0))
+        bb_width = AdvancedStrategyAnalyzer._to_float(row_dict.get('bb_width', 1.0))
+        rsi_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi_slope', 0.0))
+        is_bullish = bool(row_dict.get('is_bullish', False))
+        
         # ==========================================
-        # [A] 大型株ロジック (600%コード完全一致・聖域)
+        # コアエンジン: 大型・小型関係なく全銘柄を同じ「600%スコアリング」で評価
         # ==========================================
-        if not is_small_cap:
-            bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
-            bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
-            if bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200:
-                return False, 0.0, is_small_cap  
-            
-            if n_chg <= -2.0 or vix >= 20.0: return False, 0.0, is_small_cap
-            
-            curr_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
-            prev_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('prev_close', 0.0))
-            rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0), 50.0)
-            dev25_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0), 0.0)
-            rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0), 0.0)
-            vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
-            
-            m25 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma25', 0.0))
-            m75 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma75', 0.0))
-            m200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma200', 0.0))
-            bb_width = AdvancedStrategyAnalyzer._to_float(row_dict.get('bb_width', 1.0))
-            rsi_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi_slope', 0.0))
-            is_bullish = bool(row_dict.get('is_bullish', False))
-            
-            main_score = 0.0
-            if attr == "押し目":
-                is_uptrend = (m75 > m200) and (curr_c > m200)
-                if is_uptrend:
-                    if curr_c < m25 and rsi_val <= 35 and vol_ratio < 0.8: main_score += 100
-                    elif curr_c < m25 and rsi_val <= 45 and vol_ratio <= 1.0: main_score += 60
-                    if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 40
-            else:
-                if vol_ratio >= 2.0: main_score += 40
-                elif vol_ratio >= 1.5: main_score += 20
-                if 50 <= rsi_val <= 75: main_score += 15
-                elif 75 < rsi_val <= 85: main_score += 5
-                elif rsi_val > 85 and curr_c < prev_c: main_score -= 10
-                if rsi_slope >= 10.0: main_score += 20
-                if 0 < dev25_val <= 20: main_score += 15
-                elif dev25_val > 20: main_score += 5
-                if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 20
-                
-                if rsi_val < 30.0 and is_bullish:
-                    main_score += 50.0 
-                    
-                main_score += 30 
-                
-            surrogate_base = min(100.0, main_score)
-            mock_fin_score, mock_appear_count = 3.0, 3.0
-            tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
-            
-            total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty 
-            is_entry = (total_score >= 80) if attr == "押し目" else (total_score >= 85 and rs_21_val > 0)
-            
-            return is_entry, float(total_score), is_small_cap
-
-        # ==========================================
-        # [B] 小型株専用ロジック (ゲリラ戦特化)
-        # ==========================================
+        main_score = 0.0
+        if attr == "押し目":
+            is_uptrend = (m75 > m200) and (curr_c > m200)
+            if is_uptrend:
+                if curr_c < m25 and rsi_val <= 35 and vol_ratio < 0.8: main_score += 100
+                elif curr_c < m25 and rsi_val <= 45 and vol_ratio <= 1.0: main_score += 60
+                if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 40
         else:
-            if n_chg <= -2.0 or vix >= 20.0: return False, 0.0, is_small_cap
+            if vol_ratio >= 2.0: main_score += 40
+            elif vol_ratio >= 1.5: main_score += 20
             
-            rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0))
-            dev25_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0))
-            vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0))
-            is_bullish = bool(row_dict.get('is_bullish', False))
+            if 50 <= rsi_val <= 75: main_score += 15
+            elif 75 < rsi_val <= 85: main_score += 5
+            elif rsi_val > 85 and curr_c < prev_c: main_score -= 10
             
-            is_entry = False
-            score = 0.0
+            if rsi_slope >= 10.0: main_score += 20
+            if 0 < dev25_val <= 20: main_score += 15
+            elif dev25_val > 20: main_score += 5
+            if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 20
             
-            # 出来高急増(2倍)を条件に追加し、勝率の低いダラダラ下げ銘柄を完全に排除
-            if is_bullish and vol_ratio >= 2.0:
-                if rsi_val < 35.0 or dev25_val < -20.0:
-                    is_entry = True
-                    score = 90.0
+            if rsi_val < 30.0 and is_bullish:
+                main_score += 50.0 
+                
+            main_score += 30 
             
-            return is_entry, score, is_small_cap
+        surrogate_base = min(100.0, main_score)
+        mock_fin_score, mock_appear_count = 3.0, 3.0
+        tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
+        
+        total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty 
+        
+        is_entry = False
+        if attr == "押し目":
+            is_entry = (total_score >= 80)
+        else:
+            # ベースラインは「85点以上」で共通
+            if total_score >= 85:
+                if not is_small_cap:
+                    # 大型株：従来通り「RS > 0（TOPIXより強い）」が絶対条件
+                    if rs_21_val > 0:
+                        is_entry = True
+                else:
+                    # 小型株特例：基本はRS>0だが、「売られすぎからの強反発」であればRSマイナスでも許可
+                    if rs_21_val > 0 or (rsi_val < 30.0 and is_bullish and vol_ratio >= 1.5):
+                        is_entry = True
+                        
+        return is_entry, float(total_score), is_small_cap
 
     @staticmethod
     def calculate_limit_price(row_dict: Dict[str, Any], attr: str, n_chg: float, is_small_cap: bool) -> float:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
-        rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0))
         
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
         
+        # 浅すぎず深すぎない絶妙なバランスへ。
+        # 大型株は600%コードの0.3。小型株はヒゲが多いので0.5（ナイフを掴まない適正ライン）
         if not is_small_cap:
             base_offset = 0.5 if "中長期" in attr else (0.0 if attr == "押し目" else 0.3)
         else:
-            # 極端なパニック売り(RSI<25)の時は反発が早いので指値を浅く(0.2)して確実に取りに行く
-            base_offset = 0.2 if rsi_val < 25.0 else 0.6 
+            base_offset = 0.5
             
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price))
@@ -249,8 +242,7 @@ class PortfolioBacktester:
             'limit_placed_small': 0, 'limit_exec_small': 0,
             'limit_placed_large': 0, 'limit_exec_large': 0,
             'ts_small': 0, 'ts_small_win': 0,
-            'ts_large': 0, 'ts_large_win': 0,
-            'small_early_cut': 0, 'small_climax_exit': 0
+            'ts_large': 0, 'ts_large_win': 0
         }
         
         debug_log("Loading and calculating indicators for all tickers...")
@@ -334,113 +326,59 @@ class PortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 
                 # ==========================================
-                # [A] 大型株のエグジット (600%コード完全一致)
+                # 完全に統一されたエグジットエンジン (600%コードベース)
                 # ==========================================
-                if not pos['is_sc']:
-                    atr_mult = 2.5 
-                    ch_stop = max(pos['high_p'] - (current_atr * atr_mult), pos['entry_p'] - (current_atr * atr_mult))
-                    
-                    exit_score = 0
-                    if bool(row.get('bb_3_reversal', False)): exit_score += 40
-                    if curr_c < ch_stop: exit_score += 100 
-                    
-                    if dev25_val > 20.0 and rsi_val > 85.0 and vol_ratio > 2.0:
-                        exit_score += 100 
-                    
-                    if pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.02):
-                        exit_score += 100
-                    
-                    if current_atr > 0 and curr_c > pos['entry_p']:
-                        r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
-                        if r_mult >= 3.0 and not pos['took_3r']:
-                            sell_qty = int(pos['qty'] // 2)
-                            if sell_qty > 0:
-                                cash += sell_qty * curr_c
-                                pos['qty'] -= sell_qty
-                                total_trades += 1
-                            pos['took_3r'] = True
-                            pos['took_2r'] = True
-                        elif r_mult >= 2.0 and not pos['took_2r']:
-                            sell_qty = int(pos['qty'] // 3)
-                            if sell_qty > 0:
-                                cash += sell_qty * curr_c
-                                pos['qty'] -= sell_qty
-                                total_trades += 1
-                            pos['took_2r'] = True
-                            
-                    if bool(row.get('bb_p1_cross_down', False)): exit_score += 20
-                    if AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0)) and vol_ratio >= 1.0: exit_score += 15
-                    if AdvancedStrategyAnalyzer._to_float(row.get('macd', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('sig', 0)) and vol_ratio >= 1.0: exit_score += 15
-                    if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: exit_score += 5
-                    
-                    if exit_score >= 80:
-                        cash += pos['qty'] * curr_c
-                        total_trades += 1
-                        closed_tickers.append(ticker)
-                        if pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.02):
+                # 小型株は振れ幅が大きいため、ストップ幅のみ 2.5ATR → 3.0ATR に広げて耐える
+                atr_mult = 3.0 if pos['is_sc'] else 2.5 
+                ch_stop = max(pos['high_p'] - (current_atr * atr_mult), pos['entry_p'] - (current_atr * atr_mult))
+                
+                exit_score = 0
+                if bool(row.get('bb_3_reversal', False)): exit_score += 40
+                if curr_c < ch_stop: exit_score += 100 
+                
+                if dev25_val > 20.0 and rsi_val > 85.0 and vol_ratio > 2.0:
+                    exit_score += 100 
+                
+                # タイムストップ: 「10日」の猶予を平等に与える。変に短くすると反発前に刈られる。
+                is_time_stop = (pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.02))
+                if is_time_stop:
+                    exit_score += 100
+                
+                # 利益確定ロジック (600%コードと完全互換)
+                if current_atr > 0 and curr_c > pos['entry_p']:
+                    r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
+                    if r_mult >= 3.0 and not pos['took_3r']:
+                        sell_qty = int(pos['qty'] // 2)
+                        if sell_qty > 0:
+                            cash += sell_qty * curr_c
+                            pos['qty'] -= sell_qty
+                            total_trades += 1
+                        pos['took_3r'] = True
+                        pos['took_2r'] = True
+                    elif r_mult >= 2.0 and not pos['took_2r']:
+                        sell_qty = int(pos['qty'] // 3)
+                        if sell_qty > 0:
+                            cash += sell_qty * curr_c
+                            pos['qty'] -= sell_qty
+                            total_trades += 1
+                        pos['took_2r'] = True
+                        
+                if bool(row.get('bb_p1_cross_down', False)): exit_score += 20
+                if AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0)) and vol_ratio >= 1.0: exit_score += 15
+                if AdvancedStrategyAnalyzer._to_float(row.get('macd', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('sig', 0)) and vol_ratio >= 1.0: exit_score += 15
+                if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: exit_score += 5
+                
+                if exit_score >= 80:
+                    cash += pos['qty'] * curr_c
+                    total_trades += 1
+                    closed_tickers.append(ticker)
+                    if is_time_stop:
+                        if pos['is_sc']:
+                            self.stats['ts_small'] += 1
+                            if curr_c > pos['entry_p']: self.stats['ts_small_win'] += 1
+                        else:
                             self.stats['ts_large'] += 1
                             if curr_c > pos['entry_p']: self.stats['ts_large_win'] += 1
-
-                # ==========================================
-                # [B] 小型株専用エグジット (ラチェット＆即切り特化)
-                # ==========================================
-                else:
-                    profit_ratio = curr_c / pos['entry_p']
-                    
-                    # 1. 利益のラチェット化（動的トレイリングストップ）
-                    if profit_ratio >= 1.15:
-                        atr_mult = 1.0 # 15%超えの爆益はATR 1.0で超タイトに守る
-                    elif profit_ratio >= 1.05:
-                        atr_mult = 1.5 # 5%超えでATR 1.5に引き上げ
-                    else:
-                        atr_mult = 3.0 # 初期はノイズを許容
-                        
-                    ch_stop = max(pos['high_p'] - (current_atr * atr_mult), pos['entry_p'] - (current_atr * atr_mult))
-                    
-                    is_exit = False
-                    
-                    if curr_c < ch_stop:
-                        is_exit = True
-                    
-                    # 2. 早期出血カット（3日で-3%なら見込みなしとして切る）
-                    elif pos['days_held'] >= 3 and profit_ratio <= 0.97:
-                        is_exit = True
-                        self.stats['small_early_cut'] += 1
-                        
-                    # 通常タイムストップ（7日で利益が乗らなければ切る）
-                    elif pos['days_held'] >= 7 and profit_ratio < 1.02:
-                        is_exit = True
-                        self.stats['ts_small'] += 1
-                        if curr_c > pos['entry_p']: self.stats['ts_small_win'] += 1
-                        
-                    # 3. 出来高クライマックス即売り（仕手株の天井回避）
-                    elif rsi_val > 75.0 and vol_ratio > 3.0 and profit_ratio > 1.0:
-                        is_exit = True
-                        self.stats['small_climax_exit'] += 1
-                    
-                    # 確実な部分利確
-                    if current_atr > 0 and curr_c > pos['entry_p'] and not is_exit:
-                        r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
-                        if r_mult >= 2.5 and not pos['took_3r']:
-                            sell_qty = int(pos['qty'] // 2)
-                            if sell_qty > 0:
-                                cash += sell_qty * curr_c
-                                pos['qty'] -= sell_qty
-                                total_trades += 1
-                            pos['took_3r'] = True
-                            pos['took_2r'] = True
-                        elif r_mult >= 1.5 and not pos['took_2r']:
-                            sell_qty = int(pos['qty'] // 3)
-                            if sell_qty > 0:
-                                cash += sell_qty * curr_c
-                                pos['qty'] -= sell_qty
-                                total_trades += 1
-                            pos['took_2r'] = True
-
-                    if is_exit:
-                        cash += pos['qty'] * curr_c
-                        total_trades += 1
-                        closed_tickers.append(ticker)
 
             for ct in closed_tickers:
                 del positions[ct]
@@ -507,7 +445,7 @@ def run_integrity_tests() -> None:
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # 小型株ラチェットテストのための異常値チェック
+    # 小型株への600%コア適用テスト
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
         is_entry, score, is_sc = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
@@ -540,7 +478,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (600% Core + Small Cap Aggressive)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Unified 600% Core Engine)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -556,14 +494,12 @@ if __name__ == "__main__":
         
         print(f"==================================================")
         print(f" 🔬 アドバイザリー検証レポート")
-        print(f" [1] 指値の約定率")
-        print(f"     - 小型株(ゲリラ) : {st['limit_exec_small']}/{st['limit_placed_small']} ({sm_rate:.1f}%)")
+        print(f" [1] 指値の約定率 (大型:0.3ATR / 小型:0.5ATR)")
+        print(f"     - 小型株(適正化) : {st['limit_exec_small']}/{st['limit_placed_small']} ({sm_rate:.1f}%)")
         print(f"     - 大型株(600%版) : {st['limit_exec_large']}/{st['limit_placed_large']} ({lg_rate:.1f}%)")
-        print(f" [2] タイムストップと防衛機能の発動")
+        print(f" [2] タイムストップと防衛機能の発動 (全銘柄10日基準)")
         print(f"     - 小型特例発動回数 : {st['ts_small']} 回 (うち微益撤退: {ts_sm_win_rate:.1f}%)")
         print(f"     - 大型通常発動回数 : {st['ts_large']} 回")
-        print(f"     - 小型早期見切り(3日) : {st['small_early_cut']} 回")
-        print(f"     - 小型クライマックス売 : {st['small_climax_exit']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
