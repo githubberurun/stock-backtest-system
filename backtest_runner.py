@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 大型株専用・統合分析エンジン (検証第2弾)
+# 1. 大型株専用・統合分析エンジン (検証第3弾: 攻撃的チューニング)
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -102,13 +102,8 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 【検証第2弾】マクロ環境フィルター（インデックス200日線割れ）を無効化し、暴落時のパニック売りを拾う
-        # bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
-        # bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
-        # if bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200:
-        #     return False, 0.0
-            
-        # VIX・NASDAQ急落フィルターは維持（個別銘柄由来でない市場全体のシステマティックリスク回避）
+        # マクロ環境フィルター（インデックス200日線割れ）の無効化（継続）
+        # VIX・NASDAQ急落フィルターは維持
         if n_chg <= -2.0 or vix >= 20.0: return False, 0.0
         
         curr_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
@@ -143,7 +138,6 @@ class AdvancedStrategyAnalyzer:
             elif dev25_val > 20: main_score += 5
             if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 20
             
-            # 売られすぎ反発ボーナス
             if rsi_val < 30.0 and is_bullish:
                 main_score += 50.0 
                 
@@ -156,9 +150,10 @@ class AdvancedStrategyAnalyzer:
         total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty 
         total_score = min(100.0, max(0.0, float(total_score)))
         
-        # 反発ボーナスでRSがマイナスになるケースを考慮
         rebound_triggered = (rsi_val < 30.0 and is_bullish)
-        is_entry = (total_score >= 80) if attr == "押し目" else (total_score >= 85 and (rs_21_val > 0 or rebound_triggered))
+        
+        # 【攻撃的改修③】打席数を増やす：スイングの閾値を85->80へ緩和。RS足切りも0->-2.0へ緩和。
+        is_entry = (total_score >= 80) if attr == "押し目" else (total_score >= 80 and (rs_21_val > -2.0 or rebound_triggered))
         
         return is_entry, float(total_score)
 
@@ -296,7 +291,9 @@ class PortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 
                 exit_score = 0
-                atr_mult = 2.5 
+                
+                # 【攻撃的改修②】トレイリングストップの拡大 (2.5 -> 3.5)
+                atr_mult = 3.5 
                 ch_stop = max(pos['high_p'] - (current_atr * atr_mult), pos['entry_p'] - (current_atr * atr_mult))
                 
                 # エグジット条件の評価
@@ -305,7 +302,7 @@ class PortfolioBacktester:
                     exit_score += 100 
                     self.stats['climax_sells'] += 1
                     
-                # 【検証第2弾】タイムストップを10日から20日へ延長（握力強化）
+                # タイムストップは20日を維持
                 if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.02): 
                     exit_score += 100
                     self.stats['time_stops'] += 1
@@ -317,10 +314,11 @@ class PortfolioBacktester:
                 if AdvancedStrategyAnalyzer._to_float(row.get('macd', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('sig', 0)) and vol_ratio >= 1.0: exit_score += 15
                 if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: exit_score += 5
 
-                # 利益確定
+                # 【攻撃的改修①】分割利確ラインの大幅引き上げ（チキン利食い防止）
+                # 3.0倍で1/3利確、5.0倍で残り半分を利確するように変更
                 if current_atr > 0 and curr_c > pos['entry_p'] and exit_score < 80:
                     r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
-                    if r_mult >= 3.0 and not pos['took_3r']:
+                    if r_mult >= 5.0 and not pos['took_3r']:
                         sell_qty = int(pos['qty'] // 2)
                         if sell_qty > 0:
                             cash += sell_qty * curr_c
@@ -328,7 +326,7 @@ class PortfolioBacktester:
                             total_trades += 1
                         pos['took_3r'] = True
                         pos['took_2r'] = True
-                    elif r_mult >= 2.0 and not pos['took_2r']:
+                    elif r_mult >= 3.0 and not pos['took_2r']:
                         sell_qty = int(pos['qty'] // 3)
                         if sell_qty > 0:
                             cash += sell_qty * curr_c
@@ -399,7 +397,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Large Cap logic (Ablation #2)...")
+    debug_log("Running integrity and edge-case tests for Large Cap logic (Ablation #3: Aggressive)...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -431,7 +429,7 @@ if __name__ == "__main__":
             exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (LARGE CAP - ABLATION #2)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (LARGE CAP - ABLATION #3)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -441,7 +439,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Ablation #2)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Ablation #3: Aggressive)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -455,7 +453,7 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 検証第2弾 分析レポート")
+        print(f" 🔬 検証第3弾 (攻撃的チューニング) 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f" [2] タイムストップ(20日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
         print(f" [3] クライマックス売り発動: {st['climax_sells']} 回")
