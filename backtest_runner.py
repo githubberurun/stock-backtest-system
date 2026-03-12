@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 大型株専用・統合分析エンジン
+# 1. 大型株専用・統合分析エンジン (検証第2弾)
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -102,14 +102,13 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
-        bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
-        
-        # マクロ環境フィルター（インデックスが200日線割れの場合はエントリー見送り）
-        if bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200:
-            return False, 0.0
+        # 【検証第2弾】マクロ環境フィルター（インデックス200日線割れ）を無効化し、暴落時のパニック売りを拾う
+        # bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
+        # bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
+        # if bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200:
+        #     return False, 0.0
             
-        # VIX・NASDAQ急落フィルター
+        # VIX・NASDAQ急落フィルターは維持（個別銘柄由来でない市場全体のシステマティックリスク回避）
         if n_chg <= -2.0 or vix >= 20.0: return False, 0.0
         
         curr_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
@@ -144,7 +143,7 @@ class AdvancedStrategyAnalyzer:
             elif dev25_val > 20: main_score += 5
             if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 20
             
-            # 稼働コードの売られすぎ反発ボーナス
+            # 売られすぎ反発ボーナス
             if rsi_val < 30.0 and is_bullish:
                 main_score += 50.0 
                 
@@ -169,7 +168,6 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # 600%達成コード基準の指値オフセット
         base_offset = 0.5 if "中長期" in attr else (0.0 if attr == "押し目" else 0.3)
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
@@ -307,7 +305,8 @@ class PortfolioBacktester:
                     exit_score += 100 
                     self.stats['climax_sells'] += 1
                     
-                if pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.02): 
+                # 【検証第2弾】タイムストップを10日から20日へ延長（握力強化）
+                if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.02): 
                     exit_score += 100
                     self.stats['time_stops'] += 1
                     if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
@@ -400,13 +399,13 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Large Cap logic...")
+    debug_log("Running integrity and edge-case tests for Large Cap logic (Ablation #2)...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # 異常値の型チェックテスト (クラッシュせずに安全な初期値で処理され、エントリーが発動しないことを確認)
+    # 異常値の型チェックテスト
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
         is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
@@ -432,7 +431,7 @@ if __name__ == "__main__":
             exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (LARGE CAP ONLY)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (LARGE CAP - ABLATION #2)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -442,7 +441,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Large Cap Baseline)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Ablation #2)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -456,9 +455,9 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 大型株特化 分析レポート")
+        print(f" 🔬 検証第2弾 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
-        print(f" [2] タイムストップ(10日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
+        print(f" [2] タイムストップ(20日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
         print(f" [3] クライマックス売り発動: {st['climax_sells']} 回")
         print(f"==================================================", flush=True)
         
