@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 import yfinance as yf
-from typing import Dict, List, Any, Optional, Final, Tuple
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
 
 # ==========================================
@@ -11,14 +11,13 @@ from datetime import datetime, timedelta
 # yfinance: https://yfinance.readthedocs.io/en/latest/
 # ==========================================
 
-def diag_print(msg: str) -> None:
-    """内部デバッグ用の即時出力関数"""
+def debug_log(msg: str) -> None:
+    """内部デバッグ用のロギング関数"""
     if not isinstance(msg, str): raise TypeError("msg must be a string")
-    timestamp = datetime.now().strftime('%H:%M:%S')
-    print(f"[{timestamp}] {msg}", flush=True)
+    print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 統合分析エンジン (AdvancedStrategyAnalyzer)
+# 1. 統合分析エンジン (Entry & Exit & Limit Price)
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -44,7 +43,7 @@ class AdvancedStrategyAnalyzer:
             missing = required_cols - set(df.columns)
             raise KeyError(f"DataFrameに必須列が不足しています: {missing}")
 
-        # --- 基本指標 (旧600%コード完全互換) ---
+        # --- 600%コードと全く同じテクニカル指標の算出 ---
         df['prev_close'] = df['close'].shift(1)
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
@@ -69,7 +68,6 @@ class AdvancedStrategyAnalyzer:
         df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = df['ema12'] - df['ema26']
         df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['is_macd_improving'] = df['macd'].diff() > 0
         
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -85,7 +83,7 @@ class AdvancedStrategyAnalyzer:
         df['atr'] = tr.rolling(window=14).mean() 
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
 
-        # 【追加】古いparquetデータ用に売買代金（Turnover）の平均を計算し、小型株判定の代替とする
+        # 【追加】小型株判定のフォールバック用（25日平均売買代金）
         df['turnover'] = df['close'] * df['volume']
         df['ma25_turnover'] = df['turnover'].rolling(window=25).mean()
 
@@ -98,10 +96,7 @@ class AdvancedStrategyAnalyzer:
             df['rs_21'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
             df['rs'] = df['rs_21']
         else:
-            df['rs_21'] = 0.0
-            df['rs'] = 0.0
-            df['close_bm'] = 0.0
-            df['bm_ma200'] = 0.0
+            df['rs_21'], df['rs'], df['close_bm'], df['bm_ma200'] = 0.0, 0.0, 0.0, 0.0
 
         return df
 
@@ -112,7 +107,7 @@ class AdvancedStrategyAnalyzer:
         # --- 動的フォールバック付きの小型株判定 ---
         mcap = AdvancedStrategyAnalyzer._to_float(row_dict.get('mcap', 0.0))
         ma25_turnover = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma25_turnover', 0.0))
-        # mcapが存在しない(0.0)場合、25日平均売買代金が5億円未満なら小型株と判定
+        # mcapが存在しない場合は「25日平均売買代金が5億円未満」を小型株とみなす
         is_small_cap = (0 < mcap < 500.0) or (mcap == 0.0 and 0 < ma25_turnover < 500_000_000)
 
         bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
@@ -120,7 +115,8 @@ class AdvancedStrategyAnalyzer:
         if bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200:
             return False, 0.0, is_small_cap  
         
-        if n_chg <= -4.0 or vix >= 20.0: return False, 0.0, is_small_cap
+        # 600%達成コードのキルスイッチ（1日変化率基準）に完全回帰
+        if n_chg <= -2.0 or vix >= 20.0: return False, 0.0, is_small_cap
         
         curr_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         prev_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('prev_close', 0.0))
@@ -128,21 +124,16 @@ class AdvancedStrategyAnalyzer:
         dev25_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0), 0.0)
         rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0), 0.0)
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
-        
-        # 小型株のネガティブカット
-        if is_small_cap:
-            mr_zscore = AdvancedStrategyAnalyzer._to_float(row_dict.get('mr_zscore', 0.0))
-            if mr_zscore >= 1.0 or dev25_val <= -20.0:
-                return False, 0.0, is_small_cap
-        
         bb_width = AdvancedStrategyAnalyzer._to_float(row_dict.get('bb_width', 1.0))
         rsi_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi_slope', 0.0))
         is_bullish = bool(row_dict.get('is_bullish', False))
-        is_macd_improving = bool(row_dict.get('is_macd_improving', False))
         
+        # 小型株特有の「ナイフ掴み」を防止する絶対防衛線
+        if is_small_cap and dev25_val <= -20.0:
+            return False, 0.0, is_small_cap
+
+        # --- 600%達成コードのスコアリングロジックを1行の狂いもなく復元 ---
         main_score = 0.0
-        
-        # --- 600%達成コードのスコアリング完全互換 ---
         if vol_ratio >= 2.0: main_score += 40
         elif vol_ratio >= 1.5: main_score += 20
         
@@ -155,12 +146,10 @@ class AdvancedStrategyAnalyzer:
         elif dev25_val > 20: main_score += 5
         if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 20
         
-        # 売られすぎ水準での反発サイン（小型株保護分岐）
-        if rsi_val < 30.0 and is_bullish:
-            if is_small_cap:
-                if is_macd_improving or vol_ratio >= 1.5: main_score += 50.0 
-            else:
-                main_score += 50.0 
+        # 売られすぎ水準での反発サイン（底打ち初動の検知）
+        is_oversold_rebound = (rsi_val < 30.0 and is_bullish)
+        if is_oversold_rebound:
+            main_score += 50.0 
                 
         main_score += 30 
         
@@ -170,8 +159,17 @@ class AdvancedStrategyAnalyzer:
         
         total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty 
         
-        # 厳格なエントリーラインの復旧
-        is_entry = (total_score >= 85 and rs_21_val > 0)
+        # 【ここが重要！】小型株のRS判定バイパス特例
+        # 大型株は従来通り「TOPIXより強い（RS > 0）」が必須。
+        # 小型株は、出来高を伴う強力な大底リバウンド時のみ、RSがマイナスでも強引にエントリーを許可する。
+        is_entry = False
+        if total_score >= 85:
+            if not is_small_cap and rs_21_val > 0:
+                is_entry = True
+            elif is_small_cap:
+                if rs_21_val > 0 or (is_oversold_rebound and vol_ratio >= 1.5):
+                    is_entry = True
+
         return is_entry, float(total_score), is_small_cap
 
     @staticmethod
@@ -179,9 +177,11 @@ class AdvancedStrategyAnalyzer:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
+        
+        # 【修正】1日変化率ベースの適正な押し目幅に完全回帰
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
         
-        # 大型株は高値掴みを防ぐ0.3。小型株はダマシを避ける0.4。
+        # 大型株は600%コードの0.3に回帰。小型株はダマシ回避のため0.4に設定。
         base_offset = 0.4 if is_small_cap else 0.3
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price))
@@ -191,13 +191,13 @@ class AdvancedStrategyAnalyzer:
 # ==========================================
 class USMarketCache:
     def __init__(self) -> None:
-        diag_print("Caching US market data...")
+        debug_log("Caching US market data...")
         try:
             ndx_data = yf.Ticker("^IXIC").history(period="10y")
             vix_data = yf.Ticker("^VIX").history(period="10y")
             if not ndx_data.empty and not vix_data.empty:
-                # 5日間変化率によるキルスイッチ判定
-                self.ndx = ndx_data['Close'].pct_change(5) * 100
+                # 【修正】悪影響を及ぼしていた「5日間変化率」を破棄し、600%コードの「1日間変化率」に完全回帰
+                self.ndx = ndx_data['Close'].pct_change(1) * 100
                 self.vix = vix_data['Close']
                 self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
                 self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
@@ -222,18 +222,17 @@ class PortfolioBacktester:
         self.cash: float = initial_cash
         self.initial_cash: float = initial_cash
         self.max_positions: int = max_positions
-        self.attr: str = "スイング" # 爆益ロジックのためスイングに完全固定
+        self.attr: str = "スイング" # 爆益ロジックのためスイングに固定
         self.us_market = USMarketCache()
         
         self.stats = {
             'limit_placed_small': 0, 'limit_exec_small': 0,
             'limit_placed_large': 0, 'limit_exec_large': 0,
             'ts_small': 0, 'ts_small_win': 0,
-            'ts_large': 0, 'ts_large_win': 0,
-            'kill_switch_days': 0, 'kill_switch_avoids': 0
+            'ts_large': 0, 'ts_large_win': 0
         }
         
-        diag_print("Loading and calculating indicators for all tickers...")
+        debug_log("Loading and calculating indicators for all tickers...")
         self.timeline: Dict[str, Dict[str, Dict[str, Any]]] = {}
         dates_set = set()
         
@@ -258,7 +257,7 @@ class PortfolioBacktester:
                 self.timeline[d_str][ticker] = row
                 
         self.sorted_dates = sorted(list(dates_set))
-        diag_print(f"Timeline built. Total trading days: {len(self.sorted_dates)}")
+        debug_log(f"Timeline built. Total trading days: {len(self.sorted_dates)}")
 
     def run(self) -> Dict[str, Any]:
         cash = self.cash
@@ -313,9 +312,11 @@ class PortfolioBacktester:
                 pos['days_held'] += 1
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 
+                # 小型株はノイズが大きいためストップ幅を広く（3.5）、大型株は600%コード通りの2.5
                 atr_mult = 3.5 if pos['is_sc'] else 2.5
                 ch_stop = max(pos['high_p'] - (current_atr * atr_mult), pos['entry_p'] - (current_atr * atr_mult))
                 
+                # 600%達成コードのExitスコアロジックを完全復元
                 exit_score = 0
                 if bool(row.get('bb_3_reversal', False)): exit_score += 40
                 if curr_c < ch_stop: exit_score += 100 
@@ -323,12 +324,13 @@ class PortfolioBacktester:
                 if dev25_val > 20.0 and rsi_val > 85.0 and vol_ratio > 2.0:
                     exit_score += 100 
                 
-                # タイムストップ: 資金効率追求のため小型12日、大型10日
+                # タイムストップ: 小型株は呼吸させるため12日、大型株は600%コード通りの10日
                 time_stop_days = 12 if pos['is_sc'] else 10
                 is_time_stop = (pos['days_held'] >= time_stop_days and curr_c < (pos['entry_p'] * 1.02))
                 if is_time_stop:
                     exit_score += 100
                 
+                # 利益確定ロジック (600%コード完全互換)
                 if current_atr > 0 and curr_c > pos['entry_p']:
                     r_m = (curr_c - pos['entry_p']) / (current_atr * 2)
                     if r_m >= 3.0 and not pos['took_3r']:
@@ -425,15 +427,17 @@ class PortfolioBacktester:
 # 3. 堅牢性テスト & メイン実行
 # ==========================================
 def run_integrity_tests() -> None:
-    diag_print("Running integrity and edge-case tests...")
+    debug_log("Running integrity and edge-case tests...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    dummy_row_oversold = {'close_bm': 2100.0, 'bm_ma200': 2000.0, 'close': 100.0, 'open': 90.0, 'rsi': 25.0, 'is_bullish': True}
-    is_entry, score, is_sc = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_oversold, "スイング", 0.0, 15.0)
-    assert score > 50.0, "Oversold rebound failed to boost score."
+    # 小型株の特例判定（RSがマイナスでも大底なら通すか）のテスト
+    dummy_row_small_oversold = {'close_bm': 2100.0, 'bm_ma200': 2000.0, 'close': 100.0, 'open': 90.0, 'rsi': 25.0, 'is_bullish': True, 'mcap': 100.0, 'rs_21': -5.0, 'vol_ratio': 2.0}
+    is_entry, score, is_sc = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_small_oversold, "スイング", 0.0, 15.0)
+    assert is_sc is True, "Small cap detection failed."
+    assert is_entry is True, "Small cap bypass logic for RS < 0 failed."
 
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
@@ -447,7 +451,7 @@ def run_integrity_tests() -> None:
     except TypeError:
         pass
 
-    diag_print("All tests passed.")
+    debug_log("All tests passed.")
 
 if __name__ == "__main__":
     run_integrity_tests()
@@ -467,7 +471,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (600% Engine V2)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Absolute 600% Core + Small Cap Bypass)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -483,10 +487,10 @@ if __name__ == "__main__":
         
         print(f"==================================================")
         print(f" 🔬 アドバイザリー検証レポート")
-        print(f" [1] 深い指値の約定率 (最適化後)")
+        print(f" [1] 深い指値の約定率 (大型株は600%版へ回帰)")
         print(f"     - 小型株(深め) : {st['limit_exec_small']}/{st['limit_placed_small']} ({sm_rate:.1f}%)")
         print(f"     - 大型株(浅め) : {st['limit_exec_large']}/{st['limit_placed_large']} ({lg_rate:.1f}%)")
-        print(f" [2] タイムストップと小型株の握力 (12日 vs 10日)")
+        print(f" [2] タイムストップと小型株の握力 (小型12日 vs 大型10日)")
         print(f"     - 小型特例発動回数 : {st['ts_small']} 回 (うち微益撤退: {ts_sm_win_rate:.1f}%)")
         print(f"     - 大型通常発動回数 : {st['ts_large']} 回")
         print(f"==================================================", flush=True)
