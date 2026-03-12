@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 大型株専用・統合分析エンジン (検証第3弾: 攻撃的チューニング)
+# 1. 大型株専用・統合分析エンジン (実運用ディフェンス最適化版)
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -74,12 +74,14 @@ class AdvancedStrategyAnalyzer:
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
         df['rsi_slope'] = df['rsi'] - df['rsi'].shift(5)
         
+        # ボラティリティ（ATRとTrue Range）の正確な計算
         tr = pd.concat([
             (df['high'] - df['low']), 
             (df['high'] - df['close'].shift()).abs(), 
             (df['low'] - df['close'].shift()).abs()
         ], axis=1).max(axis=1)
-        df['atr'] = tr.rolling(window=14).mean() 
+        df['tr'] = tr
+        df['atr'] = df['tr'].rolling(window=14).mean() 
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
 
         if benchmark_df is not None and not benchmark_df.empty:
@@ -99,12 +101,19 @@ class AdvancedStrategyAnalyzer:
         return df
 
     @staticmethod
-    def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float]:
+    def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float, vix_pct: float) -> Tuple[bool, float]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # マクロ環境フィルター（インデックス200日線割れ）の無効化（継続）
-        # VIX・NASDAQ急落フィルターは維持
-        if n_chg <= -2.0 or vix >= 20.0: return False, 0.0
+        # 【アップデート①】VIX動的ショック検知（暴落初動の回避）
+        # VIXが極端に高い(25以上)、またはVIXが18以上で前日比+15%以上急騰した日はパニック相場とみなして見送り
+        if n_chg <= -2.5 or vix >= 25.0 or (vix >= 18.0 and vix_pct >= 15.0):
+            return False, 0.0
+            
+        # 【アップデート②】異常ボラティリティ（落ちるナイフ）の物理的排除
+        tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
+        atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
+        if atr_val > 0 and (tr_val / atr_val) >= 2.5:
+            return False, 0.0 # 平時の2.5倍以上の値幅が出た日は、悪材料の可能性が高いためスルー
         
         curr_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         prev_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('prev_close', 0.0))
@@ -152,8 +161,8 @@ class AdvancedStrategyAnalyzer:
         
         rebound_triggered = (rsi_val < 30.0 and is_bullish)
         
-        # 【攻撃的改修③】打席数を増やす：スイングの閾値を85->80へ緩和。RS足切りも0->-2.0へ緩和。
-        is_entry = (total_score >= 80) if attr == "押し目" else (total_score >= 80 and (rs_21_val > -2.0 or rebound_triggered))
+        # エントリー閾値の最適化
+        is_entry = (total_score >= 80) if attr == "押し目" else (total_score >= 80 and (rs_21_val > -1.0 or rebound_triggered))
         
         return is_entry, float(total_score)
 
@@ -163,7 +172,8 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        base_offset = 0.5 if "中長期" in attr else (0.0 if attr == "押し目" else 0.3)
+        # 指値を 0.3ATR から 0.2ATR へ浅くし、本物の反発を取り逃がさないようにする
+        base_offset = 0.5 if "中長期" in attr else (0.0 if attr == "押し目" else 0.2)
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price))
@@ -180,22 +190,27 @@ class USMarketCache:
             if not ndx_data.empty and not vix_data.empty:
                 self.ndx = ndx_data['Close'].pct_change() * 100
                 self.vix = vix_data['Close']
+                self.vix_pct = vix_data['Close'].pct_change() * 100 # VIXの前日比を計算
+                
                 self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
                 self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
+                self.vix_pct.index = self.vix_pct.index.tz_localize(None).strftime('%Y-%m-%d')
             else:
-                self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
+                self.ndx, self.vix, self.vix_pct = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
         except Exception:
-            self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
+            self.ndx, self.vix, self.vix_pct = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
 
-    def get_state(self, date_str: str) -> Tuple[float, float]:
+    def get_state(self, date_str: str) -> Tuple[float, float, float]:
         if not isinstance(date_str, str): raise TypeError("date_str must be string")
-        if self.ndx.empty or self.vix.empty: return 0.0, 15.0
+        if self.ndx.empty or self.vix.empty: return 0.0, 15.0, 0.0
         dt = datetime.strptime(date_str, '%Y-%m-%d')
         for i in range(1, 6):
             prev = (dt - timedelta(days=i)).strftime('%Y-%m-%d')
             if prev in self.ndx.index and prev in self.vix.index: 
-                return float(self.ndx[prev]), float(self.vix[prev])
-        return 0.0, 15.0
+                vix_val = float(self.vix[prev])
+                vix_pct_val = float(self.vix_pct[prev]) if pd.notna(self.vix_pct[prev]) else 0.0
+                return float(self.ndx[prev]), vix_val, vix_pct_val
+        return 0.0, 15.0, 0.0
 
 class PortfolioBacktester:
     def __init__(self, data_dir: str, initial_cash: float = 1000000.0, max_positions: int = 5) -> None:
@@ -248,7 +263,7 @@ class PortfolioBacktester:
 
         for date_str in self.sorted_dates:
             today_market = self.timeline[date_str]
-            n_chg, vix = self.us_market.get_state(date_str)
+            n_chg, vix, vix_pct = self.us_market.get_state(date_str)
             
             new_pending = []
             for order in pending_orders:
@@ -292,18 +307,17 @@ class PortfolioBacktester:
                 
                 exit_score = 0
                 
-                # 【攻撃的改修②】トレイリングストップの拡大 (2.5 -> 3.5)
-                atr_mult = 3.5 
+                # トレイリングストップ (標準的な 2.5ATR に戻し、MDDを抑える)
+                atr_mult = 2.5 
                 ch_stop = max(pos['high_p'] - (current_atr * atr_mult), pos['entry_p'] - (current_atr * atr_mult))
                 
-                # エグジット条件の評価
                 if curr_c < ch_stop: exit_score += 100 
                 if dev25_val > 20.0 and rsi_val > 85.0 and vol_ratio > 2.0: 
                     exit_score += 100 
                     self.stats['climax_sells'] += 1
                     
-                # タイムストップは20日を維持
-                if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.02): 
+                # 【アップデート③】タイムストップのスイートスポット (15日)
+                if pos['days_held'] >= 15 and curr_c < (pos['entry_p'] * 1.02): 
                     exit_score += 100
                     self.stats['time_stops'] += 1
                     if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
@@ -314,11 +328,10 @@ class PortfolioBacktester:
                 if AdvancedStrategyAnalyzer._to_float(row.get('macd', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('sig', 0)) and vol_ratio >= 1.0: exit_score += 15
                 if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: exit_score += 5
 
-                # 【攻撃的改修①】分割利確ラインの大幅引き上げ（チキン利食い防止）
-                # 3.0倍で1/3利確、5.0倍で残り半分を利確するように変更
+                # 【アップデート③】黄金比の分割利確 (2.5倍と4.0倍)
                 if current_atr > 0 and curr_c > pos['entry_p'] and exit_score < 80:
                     r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
-                    if r_mult >= 5.0 and not pos['took_3r']:
+                    if r_mult >= 4.0 and not pos['took_3r']:
                         sell_qty = int(pos['qty'] // 2)
                         if sell_qty > 0:
                             cash += sell_qty * curr_c
@@ -326,7 +339,7 @@ class PortfolioBacktester:
                             total_trades += 1
                         pos['took_3r'] = True
                         pos['took_2r'] = True
-                    elif r_mult >= 3.0 and not pos['took_2r']:
+                    elif r_mult >= 2.5 and not pos['took_2r']:
                         sell_qty = int(pos['qty'] // 3)
                         if sell_qty > 0:
                             cash += sell_qty * curr_c
@@ -348,7 +361,7 @@ class PortfolioBacktester:
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
-                    is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix)
+                    is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix, vix_pct)
                     if is_entry:
                         limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(row, self.attr, n_chg)
                         candidates.append((score, ticker, limit_p))
@@ -397,7 +410,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Large Cap logic (Ablation #3: Aggressive)...")
+    debug_log("Running integrity and edge-case tests for Real-World Optimized logic...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -406,14 +419,14 @@ def run_integrity_tests() -> None:
     # 異常値の型チェックテスト
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
-        is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
+        is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0, 0.0)
         assert isinstance(score, float), "Corrupted data should be processed safely into a float score."
         assert is_entry is False, "Corrupted data should not trigger an entry."
     except Exception as e:
         raise AssertionError(f"Failed to handle corrupted data safely: {e}")
         
     try:
-        AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0) # type: ignore
+        AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0, 0.0) # type: ignore
         assert False, "evaluate_entry should raise TypeError for non-dict input"
     except TypeError:
         pass
@@ -429,7 +442,7 @@ if __name__ == "__main__":
             exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (LARGE CAP - ABLATION #3)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (REAL-WORLD OPTIMIZED)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -439,7 +452,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Ablation #3: Aggressive)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Real-World Defense Optimized)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -453,9 +466,9 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 検証第3弾 (攻撃的チューニング) 分析レポート")
+        print(f" 🔬 実運用向け最適化 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
-        print(f" [2] タイムストップ(20日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
+        print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
         print(f" [3] クライマックス売り発動: {st['climax_sells']} 回")
         print(f"==================================================", flush=True)
         
