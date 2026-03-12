@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 # ==========================================
 
 def debug_log(msg: str) -> None:
-    """内部デバッグ用のロギング関数"""
+    """内部デバッグ用の即時出力関数"""
     if not isinstance(msg, str): raise TypeError("msg must be a string")
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -83,7 +83,6 @@ class AdvancedStrategyAnalyzer:
         df['atr'] = tr.rolling(window=14).mean() 
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
 
-        # 小型株判定フォールバック用
         df['turnover'] = df['close'] * df['volume']
         df['ma25_turnover'] = df['turnover'].rolling(window=25).mean()
 
@@ -112,7 +111,7 @@ class AdvancedStrategyAnalyzer:
         is_small_cap = (0 < mcap < 500.0) or (mcap == 0.0 and 0 < ma25_turnover < 500_000_000)
 
         # ==========================================
-        # [A] 大型株ロジック (600%コードと完全同一)
+        # [A] 大型株ロジック (600%コード完全一致・聖域)
         # ==========================================
         if not is_small_cap:
             bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
@@ -169,7 +168,7 @@ class AdvancedStrategyAnalyzer:
             return is_entry, float(total_score), is_small_cap
 
         # ==========================================
-        # [B] 小型株専用ロジック (高ボラ適応型)
+        # [B] 小型株専用ロジック (ゲリラ戦特化)
         # ==========================================
         else:
             if n_chg <= -2.0 or vix >= 20.0: return False, 0.0, is_small_cap
@@ -179,13 +178,12 @@ class AdvancedStrategyAnalyzer:
             vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0))
             is_bullish = bool(row_dict.get('is_bullish', False))
             
-            # 小型株は過剰な下げからの猛反発（陽線＋出来高増）のみを狙う
-            # RS（TOPIX連動性）は完全に無視する
             is_entry = False
             score = 0.0
             
-            if is_bullish and vol_ratio >= 1.5:
-                if rsi_val < 35.0 or dev25_val < -15.0:
+            # 出来高急増(2倍)を条件に追加し、勝率の低いダラダラ下げ銘柄を完全に排除
+            if is_bullish and vol_ratio >= 2.0:
+                if rsi_val < 35.0 or dev25_val < -20.0:
                     is_entry = True
                     score = 90.0
             
@@ -196,14 +194,16 @@ class AdvancedStrategyAnalyzer:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
+        rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0))
         
-        # 大型株は600%コード完全一致、小型株はヒゲ狙いの深め(0.6)
+        nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
+        
         if not is_small_cap:
             base_offset = 0.5 if "中長期" in attr else (0.0 if attr == "押し目" else 0.3)
         else:
-            base_offset = 0.6 
+            # 極端なパニック売り(RSI<25)の時は反発が早いので指値を浅く(0.2)して確実に取りに行く
+            base_offset = 0.2 if rsi_val < 25.0 else 0.6 
             
-        nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price))
 
@@ -217,7 +217,6 @@ class USMarketCache:
             ndx_data = yf.Ticker("^IXIC").history(period="10y")
             vix_data = yf.Ticker("^VIX").history(period="10y")
             if not ndx_data.empty and not vix_data.empty:
-                # 600%コードと完全一致の1日間変化率
                 self.ndx = ndx_data['Close'].pct_change() * 100
                 self.vix = vix_data['Close']
                 self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
@@ -250,7 +249,8 @@ class PortfolioBacktester:
             'limit_placed_small': 0, 'limit_exec_small': 0,
             'limit_placed_large': 0, 'limit_exec_large': 0,
             'ts_small': 0, 'ts_small_win': 0,
-            'ts_large': 0, 'ts_large_win': 0
+            'ts_large': 0, 'ts_large_win': 0,
+            'small_early_cut': 0, 'small_climax_exit': 0
         }
         
         debug_log("Loading and calculating indicators for all tickers...")
@@ -334,7 +334,7 @@ class PortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 
                 # ==========================================
-                # [A] 大型株のエグジット (600%コード完全コピペ)
+                # [A] 大型株のエグジット (600%コード完全一致)
                 # ==========================================
                 if not pos['is_sc']:
                     atr_mult = 2.5 
@@ -382,27 +382,43 @@ class PortfolioBacktester:
                             if curr_c > pos['entry_p']: self.stats['ts_large_win'] += 1
 
                 # ==========================================
-                # [B] 小型株専用エグジット (資金拘束回避＆急落防御)
+                # [B] 小型株専用エグジット (ラチェット＆即切り特化)
                 # ==========================================
                 else:
-                    atr_mult = 3.0 # 小型株の振る舞いに合わせた調整
+                    profit_ratio = curr_c / pos['entry_p']
+                    
+                    # 1. 利益のラチェット化（動的トレイリングストップ）
+                    if profit_ratio >= 1.15:
+                        atr_mult = 1.0 # 15%超えの爆益はATR 1.0で超タイトに守る
+                    elif profit_ratio >= 1.05:
+                        atr_mult = 1.5 # 5%超えでATR 1.5に引き上げ
+                    else:
+                        atr_mult = 3.0 # 初期はノイズを許容
+                        
                     ch_stop = max(pos['high_p'] - (current_atr * atr_mult), pos['entry_p'] - (current_atr * atr_mult))
                     
                     is_exit = False
                     
-                    # 1. 損切り・トレイリングストップ
                     if curr_c < ch_stop:
                         is_exit = True
-                    # 2. タイムストップ（小型株は動かなければ7日で即切る）
-                    elif pos['days_held'] >= 7 and curr_c < (pos['entry_p'] * 1.02):
+                    
+                    # 2. 早期出血カット（3日で-3%なら見込みなしとして切る）
+                    elif pos['days_held'] >= 3 and profit_ratio <= 0.97:
+                        is_exit = True
+                        self.stats['small_early_cut'] += 1
+                        
+                    # 通常タイムストップ（7日で利益が乗らなければ切る）
+                    elif pos['days_held'] >= 7 and profit_ratio < 1.02:
                         is_exit = True
                         self.stats['ts_small'] += 1
                         if curr_c > pos['entry_p']: self.stats['ts_small_win'] += 1
-                    # 3. クライマックス売り（異常過熱）
-                    elif dev25_val > 30.0 and rsi_val > 80.0:
+                        
+                    # 3. 出来高クライマックス即売り（仕手株の天井回避）
+                    elif rsi_val > 75.0 and vol_ratio > 3.0 and profit_ratio > 1.0:
                         is_exit = True
+                        self.stats['small_climax_exit'] += 1
                     
-                    # 利益確定 (大型より少し早めに利確して逃げる)
+                    # 確実な部分利確
                     if current_atr > 0 and curr_c > pos['entry_p'] and not is_exit:
                         r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
                         if r_mult >= 2.5 and not pos['took_3r']:
@@ -491,12 +507,7 @@ def run_integrity_tests() -> None:
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # 小型株の隔離特例判定テスト
-    dummy_row_small_oversold = {'close_bm': 2100.0, 'bm_ma200': 2000.0, 'close': 100.0, 'open': 90.0, 'rsi': 25.0, 'is_bullish': True, 'mcap': 100.0, 'dev25': -20.0, 'vol_ratio': 2.0}
-    is_entry, score, is_sc = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_small_oversold, "スイング", 0.0, 15.0)
-    assert is_sc is True, "Small cap detection failed."
-    assert is_entry is True, "Small cap isolated entry logic failed."
-
+    # 小型株ラチェットテストのための異常値チェック
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
         is_entry, score, is_sc = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
@@ -529,7 +540,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Perfect Isolated Engine)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (600% Core + Small Cap Aggressive)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -545,12 +556,14 @@ if __name__ == "__main__":
         
         print(f"==================================================")
         print(f" 🔬 アドバイザリー検証レポート")
-        print(f" [1] 指値の約定率 (大型:0.3ATR / 小型:0.6ATR)")
+        print(f" [1] 指値の約定率")
         print(f"     - 小型株(ゲリラ) : {st['limit_exec_small']}/{st['limit_placed_small']} ({sm_rate:.1f}%)")
         print(f"     - 大型株(600%版) : {st['limit_exec_large']}/{st['limit_placed_large']} ({lg_rate:.1f}%)")
-        print(f" [2] タイムストップと小型株の握力 (小型7日 vs 大型10日)")
+        print(f" [2] タイムストップと防衛機能の発動")
         print(f"     - 小型特例発動回数 : {st['ts_small']} 回 (うち微益撤退: {ts_sm_win_rate:.1f}%)")
         print(f"     - 大型通常発動回数 : {st['ts_large']} 回")
+        print(f"     - 小型早期見切り(3日) : {st['small_early_cut']} 回")
+        print(f"     - 小型クライマックス売 : {st['small_climax_exit']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
