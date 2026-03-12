@@ -48,7 +48,7 @@ class AdvancedStrategyAnalyzer:
         df['ma200'] = df['close'].rolling(window=200).mean()
         df['bb_width'] = np.where(df['ma20'] > 0, (df['std20'] * 4) / df['ma20'], 0)
         
-        # 【追加】陽線判定（洗練されたエントリー用）
+        # 陽線判定（洗練されたエントリー用）
         df['is_bullish'] = df['close'] > df['open']
         
         df['was_above_bb_p1'] = (df['high'] >= df['bb_p1']).rolling(window=5).max() > 0
@@ -76,6 +76,7 @@ class AdvancedStrategyAnalyzer:
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
 
         if benchmark_df is not None and not benchmark_df.empty:
+            if not isinstance(benchmark_df, pd.DataFrame): raise TypeError("benchmark_df must be DataFrame")
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             benchmark_df['bm_ma200'] = benchmark_df['close'].rolling(window=200).mean()
             df = df.merge(benchmark_df[['date', 'close', 'bm_ma200']], on='date', how='left', suffixes=('', '_bm'))
@@ -94,6 +95,9 @@ class AdvancedStrategyAnalyzer:
     @staticmethod
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
+        if not isinstance(attr, str): raise TypeError("attr must be a string")
+        if not isinstance(n_chg, float): raise TypeError("n_chg must be a float")
+        if not isinstance(vix, float): raise TypeError("vix must be a float")
         
         bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
         bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
@@ -152,6 +156,9 @@ class AdvancedStrategyAnalyzer:
     @staticmethod
     def calculate_limit_price(row_dict: Dict[str, Any], attr: str, n_chg: float) -> float:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
+        if not isinstance(attr, str): raise TypeError("attr must be a string")
+        if not isinstance(n_chg, float): raise TypeError("n_chg must be a float")
+        
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
@@ -192,6 +199,9 @@ class USMarketCache:
 class PortfolioBacktester:
     def __init__(self, data_dir: str, initial_cash: float = 1000000.0, max_positions: int = 5) -> None:
         if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
+        if not isinstance(initial_cash, float): raise TypeError("initial_cash must be float")
+        if not isinstance(max_positions, int): raise TypeError("max_positions must be int")
+        
         self.cash: float = initial_cash
         self.initial_cash: float = initial_cash
         self.max_positions: int = max_positions
@@ -202,14 +212,14 @@ class PortfolioBacktester:
         self.timeline: Dict[str, Dict[str, Dict[str, Any]]] = {}
         dates_set = set()
         
-        bm_path = f"{data_dir}/13060.parquet"
+        bm_path = os.path.join(data_dir, "13060.parquet")
         bm_df = pd.read_parquet(bm_path) if os.path.exists(bm_path) else None
         
         files = [f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet"]
         
         for file in files:
             ticker = file.replace(".parquet", "")
-            df = pd.read_parquet(f"{data_dir}/{file}")
+            df = pd.read_parquet(os.path.join(data_dir, file))
             df = AdvancedStrategyAnalyzer.calculate_indicators(df, bm_df)
             if df.empty: continue
             
@@ -256,7 +266,7 @@ class PortfolioBacktester:
                             positions[ticker] = {
                                 'qty': qty, 'entry_p': exec_price, 'high_p': exec_price, 
                                 'took_2r': False, 'took_3r': False,
-                                'days_held': 0  # 【洗練③】タイムストップ用のカウンタ
+                                'days_held': 0 
                             }
             pending_orders = new_pending
 
@@ -279,11 +289,11 @@ class PortfolioBacktester:
                 if bool(row.get('bb_3_reversal', False)): exit_score += 40
                 if curr_c < ch_stop: exit_score += 100 
                 
-                # 【洗練②】クライマックス売り判定（過熱感の極致で強制利確）
+                # クライマックス売り判定（過熱感の極致で強制利確）
                 if dev25_val > 20.0 and rsi_val > 85.0 and vol_ratio > 2.0:
                     exit_score += 100 
                 
-                # 【洗練③】タイムストップ（10日経過で利益が2%未満なら撤退）
+                # タイムストップ（10日経過で利益が2%未満なら撤退）
                 if pos['days_held'] >= 10 and curr_c < (pos['entry_p'] * 1.02):
                     exit_score += 100
                 
@@ -378,7 +388,7 @@ def run_integrity_tests() -> None:
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # 【追加検証】売られすぎ反発によるエントリーのスコアブースト
+    # 売られすぎ反発によるエントリーのスコアブースト検証
     dummy_row_oversold = {'close_bm': 2100.0, 'bm_ma200': 2000.0, 'close': 100.0, 'open': 90.0, 'rsi': 25.0, 'is_bullish': True}
     is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_oversold, "スイング", 0.0, 15.0)
     assert score > 50.0, "Oversold rebound failed to boost score."
@@ -395,7 +405,7 @@ def run_integrity_tests() -> None:
     except TypeError:
         pass
 
-    debug_log("All tests passed.")
+    debug_log("✅ All tests passed.")
 
 if __name__ == "__main__":
     run_integrity_tests()
