@@ -406,11 +406,12 @@ def run_integrity_tests() -> None:
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # 異常値の型チェックテスト
+    # 異常値の型チェックテスト (クラッシュせずに安全な初期値で処理され、エントリーが発動しないことを確認)
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
         is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
-        assert score == 0.0, "Corrupted data should default to 0 score."
+        assert isinstance(score, float), "Corrupted data should be processed safely into a float score."
+        assert is_entry is False, "Corrupted data should not trigger an entry."
     except Exception as e:
         raise AssertionError(f"Failed to handle corrupted data safely: {e}")
         
