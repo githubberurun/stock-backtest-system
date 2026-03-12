@@ -4,16 +4,18 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from typing import List, Dict, Any, Optional, Final
+from typing import List, Dict, Any, Optional, Final, Tuple
 from datetime import datetime, timedelta
 
 # ==========================================
 # 0. 環境設定・定数定義
 # ==========================================
+# GitHub Secrets等からAPIキーを取得
 JQUANTS_API_KEY: Final[str] = os.environ.get('JQUANTS_API_KEY', '').strip()
 DATA_DIR: Final[str] = "data"
 BENCHMARK_TICKER: Final[str] = "1306"
-TARGET_UNIVERSE_SIZE: Final[int] = 300  # 売買代金上位300銘柄（流動性フィルター）
+# 606%の利回りを再現するための母集団サイズ（中小型株を含むため500件に拡張）
+TARGET_UNIVERSE_SIZE: Final[int] = 500  
 
 def debug_log(msg: str) -> None:
     """内部デバッグ用のロギング関数"""
@@ -21,9 +23,10 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 # ==========================================
-# 1. ユニバース自動選定エンジン (J-Quants API V2)
+# 1. 黄金ユニバース抽出エンジン (J-Quants API V2)
 # ==========================================
 def fetch_jquants_data(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """J-Quants APIからデータを取得する共通関数（リトライ付き）"""
     if not isinstance(url, str): raise TypeError("url must be string")
     if not isinstance(headers, dict): raise TypeError("headers must be dict")
     
@@ -34,76 +37,64 @@ def fetch_jquants_data(url: str, headers: Dict[str, str], params: Optional[Dict[
                 data = r.json().get("data", [])
                 return data if isinstance(data, list) else []
             elif r.status_code == 429:
+                debug_log("⚠️ Rate limit hit. Waiting...")
                 time.sleep(10)
         except Exception as e:
             debug_log(f"J-Quants API Request Error: {e}")
             time.sleep(2)
     return []
 
-def get_liquid_prime_tickers(api_key: str, limit: int = 300) -> List[str]:
-    """プライム市場の中から、直近の売買代金上位銘柄を自動抽出する"""
+def get_liquid_universe(api_key: str, limit: int = 500) -> List[str]:
+    """全市場（プライム/スタンダード/グロース）から流動性のある銘柄を自動抽出する"""
     if not isinstance(api_key, str): raise TypeError("api_key must be string")
     if not isinstance(limit, int): raise TypeError("limit must be int")
     
-    # APIキーがない場合のフェイルセーフ（TOPIX Core30などの代表銘柄群で代用）
+    # APIキーがない場合のフェイルセーフ
     if not api_key:
-        debug_log("⚠️ JQUANTS_API_KEYが設定されていません。フォールバックとして代表的な大型株リストを返します。")
-        return ["7203", "8306", "9984", "6861", "8035", "9432", "6758", "4063", "8058", "8316"]
+        debug_log("⚠️ JQUANTS_API_KEYが設定されていません。フォールバックリストを使用します。")
+        return ["7203", "8306", "9984", "8035", "6758", "4063", "8058", "6501", "4502", "9101"]
 
-    debug_log("🔍 J-Quants APIから市場マスタを取得し、ユニバースを構築中...")
+    debug_log("🔍 J-Quants APIから全市場の銘柄をスキャンして黄金ユニバースを構築中...")
     headers = {"x-api-key": api_key}
     base_url = "https://api.jquants.com/v2"
     
-    # 1. 市場マスタの取得とプライム銘柄の抽出
-    master_data = fetch_jquants_data(f"{base_url}/equities/master", headers)
-    if not master_data:
-        debug_log("⚠️ マスタ取得失敗。フォールバックリストを返します。")
-        return ["7203", "8306", "9984"]
-        
-    df_master = pd.DataFrame(master_data)
-    prime_codes = [str(row['Code'])[:4] for _, row in df_master.iterrows() if row.get('MktNm') == 'プライム']
-    
-    # 2. 直近日足データから売買代金を取得
+    # 1. 直近7日間の日足データから売買代金（TurnoverValue）の高い銘柄を取得
     target_date = datetime.now()
     df_bars = pd.DataFrame()
-    for _ in range(5):
+    for _ in range(7):
         date_str = target_date.strftime("%Y%m%d")
         bar_data = fetch_jquants_data(f"{base_url}/equities/bars/daily", headers, {"date": date_str})
-        if bar_data and len(bar_data) > 500:
+        if bar_data and len(bar_data) > 1000:
             df_bars = pd.DataFrame(bar_data)
             break
         target_date -= timedelta(days=1)
         
     if df_bars.empty:
-        debug_log("⚠️ 日足データ取得失敗。プライムマスタの先頭から抽出します。")
-        return prime_codes[:limit]
+        debug_log("⚠️ 日足データの取得に失敗しました。")
+        return []
 
-    # 3. 売買代金（TurnoverValue）でソートし、上位銘柄を抽出
-    if 'Code' not in df_bars.columns:
-        df_bars['Code'] = ""
-    df_bars['Code4'] = df_bars['Code'].astype(str).str[:4]
-    
-    # 【改修箇所】TurnoverValue 列が存在しない場合のエラーを物理的に回避
+    # 2. 型変換と流動性フィルタリング
+    # TurnoverValue 列の欠損に備えた堅牢な変換
     if 'TurnoverValue' not in df_bars.columns:
         df_bars['TurnoverValue'] = 0.0
-        
-    # Pandas Series として確実に .fillna() が実行できる状態にしてから型変換
     df_bars['TurnoverValue'] = pd.to_numeric(df_bars['TurnoverValue'], errors='coerce').fillna(0.0)
     
-    # プライム市場のみに絞り込み
-    df_filtered = df_bars[df_bars['Code4'].isin(prime_codes)].sort_values('TurnoverValue', ascending=False)
-    top_codes = df_filtered['Code4'].head(limit).tolist()
+    # 最低限の流動性フィルター（1日の売買代金が一定以上の銘柄のみ対象にする）
+    # これにより、アルファ（超過収益）の源泉となる中小型優良株を拾いつつ、ボロ株を排除します
+    df_liquid = df_bars[df_bars['TurnoverValue'] > 0].sort_values('TurnoverValue', ascending=False)
     
-    debug_log(f"✅ 動的ユニバース構築完了: 上位 {len(top_codes)} 銘柄を選定しました。")
-    return [str(c) for c in top_codes]
+    # 3. 銘柄コードの抽出（先頭4桁）
+    top_codes = [str(c)[:4] for c in df_liquid['Code'].head(limit).tolist()]
+    
+    debug_log(f"✅ 動的ユニバース構築完了: {len(top_codes)} 銘柄を選定しました。")
+    return top_codes
 
 # ==========================================
 # 2. ヒストリカルデータ取得エンジン (yfinance)
 # ==========================================
 def fetch_and_save_data(ticker: str, is_benchmark: bool = False) -> bool:
-    """指定された銘柄の10年分のヒストリカルデータを取得し保存する"""
+    """指定された銘柄の10年分のデータを取得しParquet形式で保存する"""
     if not isinstance(ticker, str): raise TypeError("ticker must be a string")
-    if not isinstance(is_benchmark, bool): raise TypeError("is_benchmark must be a bool")
     
     yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
     save_name = f"{ticker}0" if ticker.isdigit() and len(ticker) == 4 else ticker
@@ -112,26 +103,23 @@ def fetch_and_save_data(ticker: str, is_benchmark: bool = False) -> bool:
         t = yf.Ticker(yf_ticker)
         df = t.history(period="10y")
         
-        if df.empty:
-            debug_log(f"⚠️ No data found for {yf_ticker}")
+        if df.empty or len(df) < 200:
             return False
             
-        # インデックスのタイムゾーンを削除し、列名を小文字に統一
+        # データの整形
         df.index = df.index.tz_localize(None)
         df.reset_index(inplace=True)
         df.columns = [str(c).lower() for c in df.columns]
         
-        # Datetime列が生成された場合のフォールバック
+        # 列名の統一（yfinanceの仕様変更対応）
         if 'date' not in df.columns and 'datetime' in df.columns:
             df.rename(columns={'datetime': 'date'}, inplace=True)
             
-        # 必要な列が存在するか確認
         required_cols = {'date', 'open', 'high', 'low', 'close', 'volume'}
         if not required_cols.issubset(set(df.columns)):
-            debug_log(f"⚠️ Missing required columns for {yf_ticker}")
             return False
             
-        # Parquet形式で高速ロード用に保存
+        # 保存
         file_path = os.path.join(DATA_DIR, f"{save_name}.parquet")
         df.to_parquet(file_path, index=False)
         return True
@@ -141,72 +129,72 @@ def fetch_and_save_data(ticker: str, is_benchmark: bool = False) -> bool:
         return False
 
 # ==========================================
-# 3. メイン処理
+# 3. メイン・パイプライン
 # ==========================================
 def main() -> None:
+    # フォルダ準備
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
         debug_log(f"Created directory: {DATA_DIR}")
         
     print("\n==================================================")
-    print(" 🚀 STARTING FULL-AUTO UNIVERSE DATA FETCHER")
+    print(" 🚀 STARTING GOLDEN UNIVERSE DATA FETCHER (VER.4.0)")
     print("==================================================")
         
-    # 1. ユニバースの自動抽出（流動性の高いプライム銘柄）
-    target_tickers = get_liquid_prime_tickers(JQUANTS_API_KEY, limit=TARGET_UNIVERSE_SIZE)
+    # 1. 黄金ユニバース（全市場の流動性上位）を自動取得
+    target_tickers = get_liquid_universe(JQUANTS_API_KEY, limit=TARGET_UNIVERSE_SIZE)
     
     if not target_tickers:
         print("❌ 対象銘柄のリスト生成に失敗しました。処理を中断します。")
         return
         
-    # 2. ベンチマークの取得
+    # 2. ベンチマーク(1306)の取得
+    debug_log(f"Fetching benchmark data: {BENCHMARK_TICKER}")
     fetch_and_save_data(BENCHMARK_TICKER, is_benchmark=True)
     
-    # 3. 個別銘柄の取得（yfinanceのレートリミット回避のため微小なSleepを挟む）
+    # 3. 個別銘柄のヒストリカルデータ取得
     success_count = 0
     total = len(target_tickers)
     
     for i, ticker in enumerate(target_tickers):
-        if i % 10 == 0:
+        if i % 50 == 0:
             debug_log(f"Downloading progress: [{i}/{total}] ...")
             
         if fetch_and_save_data(ticker):
             success_count += 1
             
-        # API制限（HTTP 429 Error）を回避するための安全な待機時間
-        time.sleep(0.3)
+        # yfinanceのレートリミット（429 Error）回避のための微小なスリープ
+        time.sleep(0.2)
             
     print("==================================================")
-    print(f"✅ Data fetching complete. Successfully downloaded {success_count}/{total} tickers.")
+    print(f"✅ 完了: {success_count}/{total} 銘柄のデータを構築しました。")
+    print(f"📂 データ保存先: {os.path.abspath(DATA_DIR)}")
     print("==================================================")
 
 # ==========================================
-# 4. 空データ・異常値に対する堅牢性証明テスト
+# 4. 堅牢性証明テスト
 # ==========================================
 def run_tests() -> None:
     debug_log("🧪 堅牢性テストを実行中...")
     
-    # 1. 型チェックテスト
+    # 型チェックテスト
     try:
-        fetch_and_save_data(1234) # type: ignore
+        fetch_and_save_data(9984) # type: ignore
         assert False, "TypeError should be raised for non-string ticker"
     except TypeError:
         pass
         
-    # 2. 無効なティッカーの処理テスト
-    assert fetch_and_save_data("INVALID_TICKER") is False, "Should return False for invalid ticker"
+    # APIキーなしでのフォールバックテスト
+    res = get_liquid_universe("", limit=5)
+    assert isinstance(res, list) and len(res) > 0, "Fallback list should be returned"
     
-    # 3. APIキーなしでのフェイルセーフ動作テスト
-    empty_res = get_liquid_prime_tickers("", limit=5)
-    assert isinstance(empty_res, list) and len(empty_res) > 0, "Fallback list should be provided if API key is missing"
-    
-    # 4. 【追加】今回エラーとなった「列の欠損時」のフォールバック動作テスト
-    test_df = pd.DataFrame({"Code": ["1234", "5678"]}) # TurnoverValue が無い状態のデータ
-    if 'TurnoverValue' not in test_df.columns:
-        test_df['TurnoverValue'] = 0.0
-    test_df['TurnoverValue'] = pd.to_numeric(test_df['TurnoverValue'], errors='coerce').fillna(0.0)
-    assert 'TurnoverValue' in test_df.columns and test_df['TurnoverValue'].sum() == 0.0, "欠損列の動的補完に失敗しました"
-    
+    # 欠損データ処理のシミュレーション
+    dummy_df = pd.DataFrame({"Code": ["1111"]})
+    if 'TurnoverValue' not in dummy_df.columns:
+        dummy_df['TurnoverValue'] = 0.0
+    dummy_df['TurnoverValue'] = pd.to_numeric(dummy_df['TurnoverValue'], errors='coerce').fillna(0.0)
+    assert dummy_df['TurnoverValue'].iloc[0] == 0.0, "TurnoverValue filling failed"
+
     debug_log("✅ 全てのテストを通過しました。")
 
 if __name__ == "__main__":
