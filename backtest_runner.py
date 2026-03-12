@@ -22,7 +22,6 @@ def debug_log(msg: str) -> None:
 class AdvancedStrategyAnalyzer:
     @staticmethod
     def _to_float(val: Any, default: float = 0.0) -> float:
-        """型チェック付きのfloat変換"""
         try:
             if val is None or (isinstance(val, float) and np.isnan(val)):
                 return default
@@ -33,7 +32,6 @@ class AdvancedStrategyAnalyzer:
 
     @staticmethod
     def calculate_indicators(df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """全テクニカル指標の算出（600%実績コードの指標群を完全継承）"""
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df must be a pandas DataFrame")
         if df.empty or len(df) < 200: 
@@ -45,6 +43,7 @@ class AdvancedStrategyAnalyzer:
             missing = required_cols - set(df.columns)
             raise KeyError(f"DataFrameに必須列が不足しています: {missing}")
 
+        # === 600%実績コードと完全同一の指標群 ===
         df['prev_close'] = df['close'].shift(1)
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
@@ -169,7 +168,7 @@ class AdvancedStrategyAnalyzer:
             return is_entry, float(total_score), is_small_cap
 
         # ==========================================
-        # [B] 小型株専用ロジック (354%版・ゲリラ戦特化)
+        # [B] 小型株専用ロジック (354%版完全復元)
         # ==========================================
         else:
             if n_chg <= -2.0 or vix >= 20.0: return False, 0.0, is_small_cap
@@ -182,7 +181,7 @@ class AdvancedStrategyAnalyzer:
             is_entry = False
             score = 0.0
             
-            # RSを無視し、純粋に「出来高増＋陽線＋売られすぎ」のみを狙撃
+            # 354%を叩き出した「RS無視のゲリラエントリー」
             if is_bullish and vol_ratio >= 1.5:
                 if rsi_val < 35.0 or dev25_val < -15.0:
                     is_entry = True
@@ -198,11 +197,11 @@ class AdvancedStrategyAnalyzer:
         
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
         
-        # 大型株は0.3固定(600%準拠)。小型株は0.6だと拾いそびれるため「0.5」に最適化。
+        # 354%実績の指値 (大型0.3 / 小型0.6) へ完全復帰
         if not is_small_cap:
             base_offset = 0.5 if "中長期" in attr else (0.0 if attr == "押し目" else 0.3)
         else:
-            base_offset = 0.5 
+            base_offset = 0.6 
             
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price))
@@ -217,7 +216,7 @@ class USMarketCache:
             ndx_data = yf.Ticker("^IXIC").history(period="10y")
             vix_data = yf.Ticker("^VIX").history(period="10y")
             if not ndx_data.empty and not vix_data.empty:
-                # 1日間変化率基準
+                # 600% / 354%実績の「1日間変化率」へ完全復帰
                 self.ndx = ndx_data['Close'].pct_change() * 100
                 self.vix = vix_data['Close']
                 self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
@@ -243,6 +242,10 @@ class PortfolioBacktester:
         self.cash: float = initial_cash
         self.initial_cash: float = initial_cash
         self.max_positions: int = max_positions
+        
+        # 【中核機構】小型株の同時保有枠を「最大1枠」に制限（機会損失の防止）
+        self.max_small_cap_positions: int = 1 
+        
         self.attr: str = "スイング" 
         self.us_market = USMarketCache()
         
@@ -250,7 +253,8 @@ class PortfolioBacktester:
             'limit_placed_small': 0, 'limit_exec_small': 0,
             'limit_placed_large': 0, 'limit_exec_large': 0,
             'ts_small': 0, 'ts_small_win': 0,
-            'ts_large': 0, 'ts_large_win': 0
+            'ts_large': 0, 'ts_large_win': 0,
+            'sc_quota_blocked': 0
         }
         
         debug_log("Loading and calculating indicators for all tickers...")
@@ -291,9 +295,17 @@ class PortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
+            # 1. 注文の約定処理
             new_pending = []
             for order in pending_orders:
                 ticker = order['ticker']
+                
+                # 約定時にも小型株のクオータ（保有枠上限）を厳格にチェック
+                current_sc_count = sum(1 for p in positions.values() if p['is_sc'])
+                if order['is_sc'] and current_sc_count >= self.max_small_cap_positions:
+                    self.stats['sc_quota_blocked'] += 1
+                    continue
+                    
                 if ticker in today_market and len(positions) < self.max_positions:
                     row = today_market[ticker]
                     low_p = AdvancedStrategyAnalyzer._to_float(row.get('low', 0.0))
@@ -317,8 +329,9 @@ class PortfolioBacktester:
                             }
                             if order['is_sc']: self.stats['limit_exec_small'] += 1
                             else: self.stats['limit_exec_large'] += 1
-            pending_orders = new_pending
+            pending_orders = [] # 当日約定しなかった指値は破棄（翌日再計算）
 
+            # 2. エグジット判定
             closed_tickers = []
             for ticker, pos in positions.items():
                 if ticker not in today_market: continue
@@ -334,7 +347,7 @@ class PortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 
                 # ==========================================
-                # [A] 大型株のエグジット (600%コード完全コピペ)
+                # [A] 大型株エグジット (600%コード完全一致)
                 # ==========================================
                 if not pos['is_sc']:
                     atr_mult = 2.5 
@@ -382,31 +395,26 @@ class PortfolioBacktester:
                             if curr_c > pos['entry_p']: self.stats['ts_large_win'] += 1
 
                 # ==========================================
-                # [B] 小型株専用エグジット (354%版ベース＋微調整)
+                # [B] 小型株エグジット (354%版への完全復元: 3.0ATRストップ)
                 # ==========================================
                 else:
-                    # 損切りラインを大型株と同じ2.5ATRに引き締め（MDD改善のため）
-                    atr_mult = 2.5 
+                    atr_mult = 3.0 
                     ch_stop = max(pos['high_p'] - (current_atr * atr_mult), pos['entry_p'] - (current_atr * atr_mult))
                     
                     is_exit = False
                     
-                    # 1. ストップロス
                     if curr_c < ch_stop:
                         is_exit = True
-                    # 2. タイムストップ（7日で3%以上の利益が出なければ資金拘束を解く）
-                    elif pos['days_held'] >= 7 and curr_c < (pos['entry_p'] * 1.03):
+                    elif pos['days_held'] >= 7 and curr_c < (pos['entry_p'] * 1.02):
                         is_exit = True
                         self.stats['ts_small'] += 1
                         if curr_c > pos['entry_p']: self.stats['ts_small_win'] += 1
-                    # 3. クライマックス売り（極度の過熱）
                     elif dev25_val > 30.0 and rsi_val > 80.0:
                         is_exit = True
                     
-                    # 利益確定 (早売りせず、大型株と同じく3.0R/2.0Rまで極限まで利益を伸ばす)
                     if current_atr > 0 and curr_c > pos['entry_p'] and not is_exit:
                         r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
-                        if r_mult >= 3.0 and not pos['took_3r']:
+                        if r_mult >= 2.5 and not pos['took_3r']:
                             sell_qty = int(pos['qty'] // 2)
                             if sell_qty > 0:
                                 cash += sell_qty * curr_c
@@ -414,7 +422,7 @@ class PortfolioBacktester:
                                 total_trades += 1
                             pos['took_3r'] = True
                             pos['took_2r'] = True
-                        elif r_mult >= 2.0 and not pos['took_2r']:
+                        elif r_mult >= 1.5 and not pos['took_2r']:
                             sell_qty = int(pos['qty'] // 3)
                             if sell_qty > 0:
                                 cash += sell_qty * curr_c
@@ -430,14 +438,22 @@ class PortfolioBacktester:
             for ct in closed_tickers:
                 del positions[ct]
 
+            # 3. 新規エントリー候補の探索
             open_slots = self.max_positions - len(positions)
             if open_slots > 0 and cash > 0:
+                current_sc_count = sum(1 for p in positions.values() if p['is_sc'])
                 candidates = []
+                
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
                     is_entry, score, is_sc = AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix)
+                    
+                    # 【重要】エントリー探索時点でも小型株のクオータ（上限1枠）をチェックし、超過時は無視する
                     if is_entry:
+                        if is_sc and current_sc_count >= self.max_small_cap_positions:
+                            continue
+                        
                         limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(row, self.attr, n_chg, is_sc)
                         candidates.append((score, ticker, limit_p, is_sc))
                 
@@ -451,8 +467,11 @@ class PortfolioBacktester:
                         'allocated_cash': target_alloc,
                         'is_sc': is_sc
                     })
+                    if is_sc:
+                        current_sc_count += 1 # 今回のループ内での上限超過を防ぐ
                     open_slots -= 1
 
+            # 4. 日次資産の記録
             daily_equity = cash
             for ticker, pos in positions.items():
                 if ticker in today_market:
@@ -492,9 +511,9 @@ def run_integrity_tests() -> None:
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # 小型株の隔離特例判定テスト
-    dummy_row_small_oversold = {'close_bm': 2100.0, 'bm_ma200': 2000.0, 'close': 100.0, 'open': 90.0, 'rsi': 25.0, 'is_bullish': True, 'mcap': 100.0, 'dev25': -20.0, 'vol_ratio': 2.0}
-    is_entry, score, is_sc = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_small_oversold, "スイング", 0.0, 15.0)
+    # 354%版 小型株ロジックテスト
+    dummy_row_small = {'close_bm': 2100.0, 'bm_ma200': 2000.0, 'close': 100.0, 'open': 90.0, 'rsi': 25.0, 'is_bullish': True, 'mcap': 100.0, 'dev25': -20.0, 'vol_ratio': 2.0}
+    is_entry, score, is_sc = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_small, "スイング", 0.0, 15.0)
     assert is_sc is True, "Small cap detection failed."
     assert is_entry is True, "Small cap isolated entry logic failed."
 
@@ -530,7 +549,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Perfect Isolated Engine V2)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (354% Core + Quota Control)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -546,12 +565,14 @@ if __name__ == "__main__":
         
         print(f"==================================================")
         print(f" 🔬 アドバイザリー検証レポート")
-        print(f" [1] 指値の約定率 (大型:0.3ATR / 小型:0.5ATR)")
+        print(f" [1] 指値の約定率 (大型:0.3ATR / 小型:0.6ATR)")
         print(f"     - 小型株(ゲリラ) : {st['limit_exec_small']}/{st['limit_placed_small']} ({sm_rate:.1f}%)")
         print(f"     - 大型株(600%版) : {st['limit_exec_large']}/{st['limit_placed_large']} ({lg_rate:.1f}%)")
-        print(f" [2] タイムストップと小型株の握力 (小型7日 vs 大型10日)")
+        print(f" [2] タイムストップと小型株の握力 (小型7日/3.0ATR vs 大型10日/2.5ATR)")
         print(f"     - 小型特例発動回数 : {st['ts_small']} 回 (うち微益撤退: {ts_sm_win_rate:.1f}%)")
         print(f"     - 大型通常発動回数 : {st['ts_large']} 回")
+        print(f" [3] ポートフォリオ保護機能 (クオータ制)")
+        print(f"     - 小型株の同時保有上限ブロック : {st['sc_quota_blocked']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
