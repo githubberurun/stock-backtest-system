@@ -130,10 +130,10 @@ class AdvancedStrategyAnalyzer:
         # 数値取得
         curr_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('close'))
         prev_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('prev_close'))
-        rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0))
-        dev25_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0))
-        rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0))
-        vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0))
+        rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0), 50.0)
+        dev25_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0), 0.0)
+        rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0), 0.0)
+        vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
         ma25 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma25'))
         ma75 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma75'))
         ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma200'))
@@ -221,7 +221,12 @@ class USMarketCache:
         for i in range(1, 6):
             prev = (dt - timedelta(days=i)).strftime('%Y-%m-%d')
             if prev in self.ndx.index and prev in self.vix.index:
-                return float(self.ndx[prev]), float(self.vix[prev])
+                # yfinanceのデータ重複（Series化）によるクラッシュを防止
+                n_val = self.ndx[prev]
+                v_val = self.vix[prev]
+                if isinstance(n_val, pd.Series): n_val = n_val.iloc[-1]
+                if isinstance(v_val, pd.Series): v_val = v_val.iloc[-1]
+                return float(n_val), float(v_val)
         return 0.0, 15.0
 
 class PortfolioBacktester:
@@ -386,14 +391,23 @@ class PortfolioBacktester:
             equity_curve.append(d_equity)
 
         final_equity = equity_curve[-1] if equity_curve else self.initial_cash
-        eq_ser = pd.Series(equity_curve)
-        mdd = float((eq_ser - eq_ser.cummax()) / eq_ser.cummax()).min() if not eq_ser.empty else 0.0
+        
+        # 【修正箇所】MDDの安全かつ確実な計算ロジック（括弧の位置を修正しSeriesを安全にスカラー化）
+        if equity_curve:
+            eq_series = pd.Series(equity_curve)
+            cummax = eq_series.cummax()
+            mdd_series = (eq_series - cummax) / cummax
+            mdd = float(mdd_series.min()) if not pd.isna(mdd_series.min()) else 0.0
+        else:
+            mdd = 0.0
+            
+        ret_val = (final_equity - self.initial_cash) / self.initial_cash
         
         return {
             "Initial_Cash": self.initial_cash,
             "Final_Cash": final_equity,
             "Net_Profit": final_equity - self.initial_cash,
-            "Return": f"{(final_equity - self.initial_cash) / self.initial_cash:.2%}",
+            "Return": f"{ret_val:.2%}",
             "MDD": f"{mdd:.2%}",
             "Total_Trades": total_trades
         }
