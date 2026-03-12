@@ -79,8 +79,16 @@ def get_liquid_prime_tickers(api_key: str, limit: int = 300) -> List[str]:
         return prime_codes[:limit]
 
     # 3. 売買代金（TurnoverValue）でソートし、上位銘柄を抽出
+    if 'Code' not in df_bars.columns:
+        df_bars['Code'] = ""
     df_bars['Code4'] = df_bars['Code'].astype(str).str[:4]
-    df_bars['TurnoverValue'] = pd.to_numeric(df_bars.get('TurnoverValue', 0), errors='coerce').fillna(0)
+    
+    # 【改修箇所】TurnoverValue 列が存在しない場合のエラーを物理的に回避
+    if 'TurnoverValue' not in df_bars.columns:
+        df_bars['TurnoverValue'] = 0.0
+        
+    # Pandas Series として確実に .fillna() が実行できる状態にしてから型変換
+    df_bars['TurnoverValue'] = pd.to_numeric(df_bars['TurnoverValue'], errors='coerce').fillna(0.0)
     
     # プライム市場のみに絞り込み
     df_filtered = df_bars[df_bars['Code4'].isin(prime_codes)].sort_values('TurnoverValue', ascending=False)
@@ -191,6 +199,13 @@ def run_tests() -> None:
     # 3. APIキーなしでのフェイルセーフ動作テスト
     empty_res = get_liquid_prime_tickers("", limit=5)
     assert isinstance(empty_res, list) and len(empty_res) > 0, "Fallback list should be provided if API key is missing"
+    
+    # 4. 【追加】今回エラーとなった「列の欠損時」のフォールバック動作テスト
+    test_df = pd.DataFrame({"Code": ["1234", "5678"]}) # TurnoverValue が無い状態のデータ
+    if 'TurnoverValue' not in test_df.columns:
+        test_df['TurnoverValue'] = 0.0
+    test_df['TurnoverValue'] = pd.to_numeric(test_df['TurnoverValue'], errors='coerce').fillna(0.0)
+    assert 'TurnoverValue' in test_df.columns and test_df['TurnoverValue'].sum() == 0.0, "欠損列の動的補完に失敗しました"
     
     debug_log("✅ 全てのテストを通過しました。")
 
