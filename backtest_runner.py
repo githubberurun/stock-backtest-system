@@ -195,7 +195,11 @@ class AdvancedStrategyAnalyzer:
         total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty + rebound_bonus
         total_score = min(100.0, max(0.0, round(total_score, 1)))
         
-        is_entry = (total_score >= 80) if attr == "押し目" else (total_score >= 85 and rs_21_val > 0)
+        # 【改修】猛反発ボーナス(rebound_bonus)が発動している場合は、暴落直後でありRSがマイナスになるのが自然なため、RS>0の条件を免除します。
+        if attr == "押し目":
+            is_entry = total_score >= 80
+        else:
+            is_entry = (total_score >= 85) and (rs_21_val > 0 or rebound_bonus > 0)
         
         return is_entry, float(total_score), is_small_cap
 
