@@ -1,174 +1,199 @@
 import os
+import time
 import requests
 import pandas as pd
-import time
-from typing import Dict, List, Optional, Final, Any
+import numpy as np
+import yfinance as yf
+from typing import List, Dict, Any, Optional, Final
 from datetime import datetime, timedelta
 
-# J-Quants API v2 エンドポイント
-BASE_URL: Final[str] = "https://api.jquants.com/v2"
-ENDPOINT: Final[str] = "/equities/bars/daily"
+# ==========================================
+# 0. 環境設定・定数定義
+# ==========================================
+JQUANTS_API_KEY: Final[str] = os.environ.get('JQUANTS_API_KEY', '').strip()
+DATA_DIR: Final[str] = "data"
+BENCHMARK_TICKER: Final[str] = "1306"
+TARGET_UNIVERSE_SIZE: Final[int] = 300  # 売買代金上位300銘柄（流動性フィルター）
 
-class JQuantsV2Fetcher:
-    """J-Quants API v2準拠のデータ取得クラス"""
-    def __init__(self, api_key: str) -> None:
-        if not isinstance(api_key, str):
-            raise TypeError("API key must be a string")
-        self.api_key: str = api_key.strip()
-        self.headers: Dict[str, str] = {"x-api-key": self.api_key}
-
-    def get_safe_start_date(self) -> str:
-        """プラン制限(10年)の境界値を考慮した開始日を算出"""
-        safe_date = datetime.now() - timedelta(days=365 * 10 - 1)
-        return safe_date.strftime("%Y-%m-%d")
-
-    def get_top_tickers(self, limit: int = 300) -> List[str]:
-        """直近の売買代金上位銘柄を抽出する"""
-        if not isinstance(limit, int) or limit <= 0:
-            raise ValueError("limit must be a positive integer")
-            
-        print("[INFO] Fetching top tickers by TurnoverValue...")
-        target_date = datetime.now().date()
-        
-        for _ in range(5): # 直近5日間でデータが存在する日を探す
-            params = {"date": target_date.strftime("%Y%m%d")}
-            try:
-                response = requests.get(f"{BASE_URL}{ENDPOINT}", headers=self.headers, params=params, timeout=30)
-                if response.status_code == 200:
-                    data = response.json().get("data", [])
-                    if len(data) > 500:
-                        df = pd.DataFrame(data)
-                        df['Va_n'] = pd.to_numeric(df.get('TurnoverValue', df.get('Va', 0)), errors='coerce')
-                        top_df = df[df['Va_n'] >= 50_000_000].sort_values('Va_n', ascending=False).head(limit)
-                        # コードの末尾(0)を削除してリスト化
-                        return [str(code)[:4] for code in top_df['Code'].tolist()]
-            except Exception as e:
-                print(f"[WARN] Failed to fetch daily data for {target_date}: {e}")
-            target_date -= timedelta(days=1)
-            time.sleep(1)
-            
-        print("[ERROR] Could not fetch recent market data.")
-        return []
-
-    def fetch(self, ticker: str) -> pd.DataFrame:
-        if not isinstance(ticker, str):
-            raise TypeError("ticker must be a string")
-            
-        code: str = f"{ticker}0" if len(ticker) == 4 else ticker
-        start_date: str = self.get_safe_start_date()
-        all_data: List[Dict[str, Any]] = []
-        pagination_key: Optional[str] = None
-
-        while True:
-            params: Dict[str, Any] = {"code": code, "from": start_date}
-            if pagination_key:
-                params["pagination_key"] = pagination_key
-
-            try:
-                response = requests.get(f"{BASE_URL}{ENDPOINT}", headers=self.headers, params=params, timeout=30)
-            except requests.exceptions.RequestException as e:
-                print(f"[ERROR] Network error during fetch: {e}")
-                return pd.DataFrame()
-
-            if response.status_code != 200:
-                print(f"[ERROR] API {response.status_code}: {response.text}")
-                return pd.DataFrame()
-
-            res_json = response.json()
-            all_data.extend(res_json.get("data", []))
-
-            pagination_key = res_json.get("pagination_key")
-            if not pagination_key:
-                break
-            time.sleep(0.3)
-
-        return self._clean(pd.DataFrame(all_data))
-
-    def _clean(self, df: pd.DataFrame) -> pd.DataFrame:
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError("df must be a pandas DataFrame")
-        if df.empty: 
-            return df
-            
-        col_map = {
-            'Date': 'date', 
-            'AdjClose': 'close', 'AdjC': 'close', 'C': 'close_raw', 'Close': 'close_raw',
-            'AdjHigh': 'high', 'AdjH': 'high', 'H': 'high_raw', 'High': 'high_raw',
-            'AdjLow': 'low', 'AdjL': 'low', 'L': 'low_raw', 'Low': 'low_raw',
-            'AdjOpen': 'open', 'AdjO': 'open', 'O': 'open_raw', 'Open': 'open_raw',
-            'AdjVolume': 'volume', 'AdjVo': 'volume', 'Vo': 'volume_raw', 'Volume': 'volume_raw'
-        }
-        df = df.rename(columns=col_map)
-        
-        if 'close' not in df.columns and 'close_raw' in df.columns:
-            df = df.rename(columns={
-                'close_raw': 'close', 
-                'high_raw': 'high', 
-                'low_raw': 'low', 
-                'open_raw': 'open', 
-                'volume_raw': 'volume'
-            })
-
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-        if 'date' in df.columns:
-            df = df.dropna(subset=['close']).sort_values("date").reset_index(drop=True)
-            
-        return df
+def debug_log(msg: str) -> None:
+    """内部デバッグ用のロギング関数"""
+    if not isinstance(msg, str): raise TypeError("msg must be a string")
+    print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 # ==========================================
-# 空データ・異常値に対する堅牢性証明テスト
+# 1. ユニバース自動選定エンジン (J-Quants API V2)
 # ==========================================
-def test_integrity() -> None:
-    print("[TEST] Running integrity tests for data_fetcher.py...")
-    dummy_fetcher = JQuantsV2Fetcher("dummy_key")
+def fetch_jquants_data(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    if not isinstance(url, str): raise TypeError("url must be string")
+    if not isinstance(headers, dict): raise TypeError("headers must be dict")
     
-    df_mock_adj = pd.DataFrame({
-        'Date': ['2026-01-01'], 'AdjC': [150.5], 'AdjH': [155.0], 
-        'AdjL': [149.0], 'AdjO': [150.0], 'AdjVo': [5000]
-    })
-    cleaned_adj = dummy_fetcher._clean(df_mock_adj)
-    assert 'close' in cleaned_adj.columns, "AdjC should be mapped to 'close'"
-    assert cleaned_adj['close'].iloc[0] == 150.5, "Value matching failed for AdjC"
+    for _ in range(3):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=30)
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                return data if isinstance(data, list) else []
+            elif r.status_code == 429:
+                time.sleep(10)
+        except Exception as e:
+            debug_log(f"J-Quants API Request Error: {e}")
+            time.sleep(2)
+    return []
 
-    df_empty = pd.DataFrame()
-    cleaned_empty = dummy_fetcher._clean(df_empty)
-    assert cleaned_empty.empty, "Empty DataFrame should return empty DataFrame"
+def get_liquid_prime_tickers(api_key: str, limit: int = 300) -> List[str]:
+    """プライム市場の中から、直近の売買代金上位銘柄を自動抽出する"""
+    if not isinstance(api_key, str): raise TypeError("api_key must be string")
+    if not isinstance(limit, int): raise TypeError("limit must be int")
     
-    # 型チェック例外のテスト
+    # APIキーがない場合のフェイルセーフ（TOPIX Core30などの代表銘柄群で代用）
+    if not api_key:
+        debug_log("⚠️ JQUANTS_API_KEYが設定されていません。フォールバックとして代表的な大型株リストを返します。")
+        return ["7203", "8306", "9984", "6861", "8035", "9432", "6758", "4063", "8058", "8316"]
+
+    debug_log("🔍 J-Quants APIから市場マスタを取得し、ユニバースを構築中...")
+    headers = {"x-api-key": api_key}
+    base_url = "https://api.jquants.com/v2"
+    
+    # 1. 市場マスタの取得とプライム銘柄の抽出
+    master_data = fetch_jquants_data(f"{base_url}/equities/master", headers)
+    if not master_data:
+        debug_log("⚠️ マスタ取得失敗。フォールバックリストを返します。")
+        return ["7203", "8306", "9984"]
+        
+    df_master = pd.DataFrame(master_data)
+    prime_codes = [str(row['Code'])[:4] for _, row in df_master.iterrows() if row.get('MktNm') == 'プライム']
+    
+    # 2. 直近日足データから売買代金を取得
+    target_date = datetime.now()
+    df_bars = pd.DataFrame()
+    for _ in range(5):
+        date_str = target_date.strftime("%Y%m%d")
+        bar_data = fetch_jquants_data(f"{base_url}/equities/bars/daily", headers, {"date": date_str})
+        if bar_data and len(bar_data) > 500:
+            df_bars = pd.DataFrame(bar_data)
+            break
+        target_date -= timedelta(days=1)
+        
+    if df_bars.empty:
+        debug_log("⚠️ 日足データ取得失敗。プライムマスタの先頭から抽出します。")
+        return prime_codes[:limit]
+
+    # 3. 売買代金（TurnoverValue）でソートし、上位銘柄を抽出
+    df_bars['Code4'] = df_bars['Code'].astype(str).str[:4]
+    df_bars['TurnoverValue'] = pd.to_numeric(df_bars.get('TurnoverValue', 0), errors='coerce').fillna(0)
+    
+    # プライム市場のみに絞り込み
+    df_filtered = df_bars[df_bars['Code4'].isin(prime_codes)].sort_values('TurnoverValue', ascending=False)
+    top_codes = df_filtered['Code4'].head(limit).tolist()
+    
+    debug_log(f"✅ 動的ユニバース構築完了: 上位 {len(top_codes)} 銘柄を選定しました。")
+    return [str(c) for c in top_codes]
+
+# ==========================================
+# 2. ヒストリカルデータ取得エンジン (yfinance)
+# ==========================================
+def fetch_and_save_data(ticker: str, is_benchmark: bool = False) -> bool:
+    """指定された銘柄の10年分のヒストリカルデータを取得し保存する"""
+    if not isinstance(ticker, str): raise TypeError("ticker must be a string")
+    if not isinstance(is_benchmark, bool): raise TypeError("is_benchmark must be a bool")
+    
+    yf_ticker = f"{ticker}.T" if ticker.isdigit() else ticker
+    save_name = f"{ticker}0" if ticker.isdigit() and len(ticker) == 4 else ticker
+    
     try:
-        dummy_fetcher.fetch(1234) # type: ignore
-        assert False, "fetch() should raise TypeError for non-string input"
+        t = yf.Ticker(yf_ticker)
+        df = t.history(period="10y")
+        
+        if df.empty:
+            debug_log(f"⚠️ No data found for {yf_ticker}")
+            return False
+            
+        # インデックスのタイムゾーンを削除し、列名を小文字に統一
+        df.index = df.index.tz_localize(None)
+        df.reset_index(inplace=True)
+        df.columns = [str(c).lower() for c in df.columns]
+        
+        # Datetime列が生成された場合のフォールバック
+        if 'date' not in df.columns and 'datetime' in df.columns:
+            df.rename(columns={'datetime': 'date'}, inplace=True)
+            
+        # 必要な列が存在するか確認
+        required_cols = {'date', 'open', 'high', 'low', 'close', 'volume'}
+        if not required_cols.issubset(set(df.columns)):
+            debug_log(f"⚠️ Missing required columns for {yf_ticker}")
+            return False
+            
+        # Parquet形式で高速ロード用に保存
+        file_path = os.path.join(DATA_DIR, f"{save_name}.parquet")
+        df.to_parquet(file_path, index=False)
+        return True
+        
+    except Exception as e:
+        debug_log(f"❌ Error fetching {yf_ticker}: {e}")
+        return False
+
+# ==========================================
+# 3. メイン処理
+# ==========================================
+def main() -> None:
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+        debug_log(f"Created directory: {DATA_DIR}")
+        
+    print("\n==================================================")
+    print(" 🚀 STARTING FULL-AUTO UNIVERSE DATA FETCHER")
+    print("==================================================")
+        
+    # 1. ユニバースの自動抽出（流動性の高いプライム銘柄）
+    target_tickers = get_liquid_prime_tickers(JQUANTS_API_KEY, limit=TARGET_UNIVERSE_SIZE)
+    
+    if not target_tickers:
+        print("❌ 対象銘柄のリスト生成に失敗しました。処理を中断します。")
+        return
+        
+    # 2. ベンチマークの取得
+    fetch_and_save_data(BENCHMARK_TICKER, is_benchmark=True)
+    
+    # 3. 個別銘柄の取得（yfinanceのレートリミット回避のため微小なSleepを挟む）
+    success_count = 0
+    total = len(target_tickers)
+    
+    for i, ticker in enumerate(target_tickers):
+        if i % 10 == 0:
+            debug_log(f"Downloading progress: [{i}/{total}] ...")
+            
+        if fetch_and_save_data(ticker):
+            success_count += 1
+            
+        # API制限（HTTP 429 Error）を回避するための安全な待機時間
+        time.sleep(0.3)
+            
+    print("==================================================")
+    print(f"✅ Data fetching complete. Successfully downloaded {success_count}/{total} tickers.")
+    print("==================================================")
+
+# ==========================================
+# 4. 空データ・異常値に対する堅牢性証明テスト
+# ==========================================
+def run_tests() -> None:
+    debug_log("🧪 堅牢性テストを実行中...")
+    
+    # 1. 型チェックテスト
+    try:
+        fetch_and_save_data(1234) # type: ignore
+        assert False, "TypeError should be raised for non-string ticker"
     except TypeError:
         pass
-
-    print("[TEST] All integrity tests passed.")
+        
+    # 2. 無効なティッカーの処理テスト
+    assert fetch_and_save_data("INVALID_TICKER") is False, "Should return False for invalid ticker"
+    
+    # 3. APIキーなしでのフェイルセーフ動作テスト
+    empty_res = get_liquid_prime_tickers("", limit=5)
+    assert isinstance(empty_res, list) and len(empty_res) > 0, "Fallback list should be provided if API key is missing"
+    
+    debug_log("✅ 全てのテストを通過しました。")
 
 if __name__ == "__main__":
-    test_integrity()
-    
-    key = os.getenv("JQUANTS_API_KEY")
-    if not key:
-        raise ValueError("[FATAL] JQUANTS_API_KEY is not set in environment variables.")
-        
-    fetcher = JQuantsV2Fetcher(key)
-    os.makedirs("data", exist_ok=True)
-    
-    # 動的に上位300銘柄を取得
-    target_tickers = fetcher.get_top_tickers(limit=300)
-    if "13060" not in target_tickers:
-        target_tickers.append("13060") # ベンチマークを確実に追加
-        
-    print(f"[INFO] Starting data fetch for {len(target_tickers)} tickers...")
-    
-    for i, target_ticker in enumerate(target_tickers):
-        print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ")
-        fetched_data = fetcher.fetch(target_ticker)
-        if not fetched_data.empty:
-            fetched_data.to_parquet(f"data/{target_ticker}.parquet", index=False)
-            print(f"OK ({len(fetched_data)} rows)")
-        else:
-            print("FAILED")
+    run_tests()
+    main()
