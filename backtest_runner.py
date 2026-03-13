@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 大型株専用・統合分析エンジン (黄金比ロジック復元)
+# 1. 大型株専用・統合分析エンジン
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -103,7 +103,6 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # マクロフィルター: ナスダックが-2.5%以上の歴史的大暴落の日は拾わない
         if n_chg <= -2.5 or vix >= 33.0:
             return False, 0.0, False
             
@@ -121,7 +120,6 @@ class AdvancedStrategyAnalyzer:
         
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
 
-        # 1048%を叩き出した最も優れたバランスへ復元
         if is_bear_market:
             if rsi_val > 30.0 or vol_ratio < 1.5:
                 return False, 0.0, is_bear_market
@@ -144,7 +142,6 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # 黄金比：ベア相場やVIX高の時は「1.2ATR下」で拾う
         if is_bear_market or vix >= 20.0:
             base_offset = 1.2
         else:
@@ -249,13 +246,11 @@ class PortfolioBacktester:
                     
                     self.stats['limit_placed'] += 1
                     
-                    # 窓開けキャンセル（強力なディフェンス機能は継続）
                     if open_p < limit_p:
                         self.stats['gap_down_cancels'] += 1
                         continue 
                         
                     if low_p <= limit_p:
-                        # 0.2%のスリッページ・手数料ペナルティを付与
                         exec_price = limit_p * 1.002 
                         
                         alloc_cash = order['allocated_cash']
@@ -283,21 +278,15 @@ class PortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                # ==========================================
-                # 【MDD改善の切り札】絶対損失キャップ (Max Loss Cap)
-                # ==========================================
-                # ATRの拡大による致命傷を防ぐため、「買値から15%」で物理的に損切りを掛ける
+                # 絶対損失キャップ（-15%）とATR(2.0)の二重防衛
                 hard_stop_price_atr = pos['entry_p'] - (current_atr * 2.0)
-                hard_stop_price_abs = pos['entry_p'] * 0.85 # -15%の絶対防衛線
-                
-                # より浅い(安全な)方を採用
+                hard_stop_price_abs = pos['entry_p'] * 0.85 
                 hard_stop_price = max(hard_stop_price_atr, hard_stop_price_abs)
                 
                 if curr_c <= hard_stop_price:
                     exit_score += 100
                     self.stats['hard_stops'] += 1
                 
-                # トレイリングストップは黄金比の 2.5ATR に復元
                 trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
@@ -347,14 +336,24 @@ class PortfolioBacktester:
                 
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 
-                for score, ticker, limit_p in candidates[:open_slots]:
-                    target_alloc = cash / open_slots
+                # ==========================================
+                # 【MDD限界突破策】 エントリーの時間分散（Tranche Buying）
+                # ==========================================
+                # パニック相場（VIX>=20）の時は、どんなに候補が多くても「1日最大2銘柄まで」しか注文を出さない。
+                # これにより「1日で資金の100%を底なし沼に突っ込む」リスクを根絶する。
+                is_high_risk = vix >= 20.0
+                max_daily_new_orders = 2 if is_high_risk else self.max_positions
+                allowed_slots_today = min(open_slots, max_daily_new_orders)
+                
+                for score, ticker, limit_p in candidates[:allowed_slots_today]:
+                    # オープン枠全体でキャッシュを等分（1銘柄あたり最大20%のルールは維持）
+                    target_alloc = cash / open_slots 
                     pending_orders.append({
                         'ticker': ticker,
                         'limit_price': limit_p,
                         'allocated_cash': target_alloc
                     })
-                    open_slots -= 1
+                    open_slots -= 1 # 計算上の残り枠を減らす
 
             daily_equity = cash
             for ticker, pos in positions.items():
@@ -389,7 +388,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Absolute Loss Cap Logic...")
+    debug_log("Running integrity and edge-case tests for Time Diversification Logic...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -422,7 +421,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (MAX LOSS CAP VER.)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (TIME DIVERSIFICATION VER.)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -432,7 +431,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max Loss Cap Optimized)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Time Diversification Optimized)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -446,7 +445,7 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 絶対損失上限 分析レポート")
+        print(f" 🔬 時間分散（打診買い） 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f"     ┗ 危険な窓開け回避(注文キャンセル): {st['gap_down_cancels']} 回")
         print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
