@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 大型株専用・統合分析エンジン
+# 1. 大型株専用・統合分析エンジン (スナイパー・ディフェンス版)
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -103,11 +103,13 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
+        # マクロ危機回避 (VIX 35超えは回避)
         if n_chg <= -3.0 or vix >= 35.0:
             return False, 0.0, False
             
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
+        # 異常ボラティリティ（悪材料のストップ安など）は排除
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
             return False, 0.0, False
         
@@ -121,10 +123,13 @@ class AdvancedStrategyAnalyzer:
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
 
         if is_bear_market:
-            if rsi_val > 30.0 or vol_ratio < 1.5:
+            # 【ディフェンス改修①】スナイパー・フィルター（超厳格なキャピチュレーション判定）
+            # RSI 25以下 かつ 出来高2.0倍以上（真のパニック時のみエントリー）
+            if rsi_val > 25.0 or vol_ratio < 2.0:
                 return False, 0.0, is_bear_market
             total_score = 90.0
         else:
+            # ブル相場は引き続き強い銘柄の押し目を狙う
             if rs_21_val < 0.0:
                 return False, 0.0, is_bear_market
             main_score = 30.0
@@ -142,8 +147,10 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
+        # 【ディフェンス改修②】限界突破の極深指値
+        # VIXが25以上の大パニック時は1.5ATR下という「絶対安全圏」でしか買わない
         if is_bear_market or vix >= 20.0:
-            base_offset = 1.2
+            base_offset = 1.5 if vix >= 25.0 else 1.2
         else:
             base_offset = 0.1
             
@@ -246,12 +253,14 @@ class PortfolioBacktester:
                     
                     self.stats['limit_placed'] += 1
                     
+                    # 窓開けキャンセル（超重要ディフェンス）
                     if open_p < limit_p:
                         self.stats['gap_down_cancels'] += 1
                         continue 
                         
                     if low_p <= limit_p:
-                        exec_price = limit_p * 1.002
+                        exec_price = limit_p * 1.002 # エントリー時0.2%スリッページ
+                        
                         alloc_cash = order['allocated_cash']
                         qty = alloc_cash // exec_price
                         
@@ -282,7 +291,9 @@ class PortfolioBacktester:
                     exit_score += 100
                     self.stats['hard_stops'] += 1
                 
-                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
+                # 【ディフェンス改修③】トレイリングストップのタイト化 (2.5 -> 2.0)
+                # 高値から2.0ATR下落したら利益を高速でロックインする
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.0)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
@@ -311,6 +322,7 @@ class PortfolioBacktester:
                         pos['took_2r'] = True
 
                 if exit_score >= 80:
+                    # エグジット時0.2%スリッページ
                     cash += pos['qty'] * (curr_c * 0.998)
                     total_trades += 1
                     closed_tickers.append(ticker)
@@ -331,31 +343,9 @@ class PortfolioBacktester:
                 
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 
-                # ==========================================
-                # 【最終ディフェンス】ポートフォリオ評価額に基づくVIX連動資金管理
-                # ==========================================
-                current_portfolio_value = cash
-                for tk, pos in positions.items():
-                    if tk in today_market:
-                        current_portfolio_value += pos['qty'] * (AdvancedStrategyAnalyzer._to_float(today_market[tk].get('close', pos['entry_p'])) * 0.998)
-                    else:
-                        current_portfolio_value += pos['qty'] * pos['entry_p']
-
-                # VIXによる投資比率の動的コントロール
-                base_weight = 1.0 / self.max_positions # 基本20%
-                if vix >= 25.0:
-                    weight_multiplier = 0.50 # パニック時は半額 (10%)
-                elif vix >= 20.0:
-                    weight_multiplier = 0.75 # 警戒時は縮小 (15%)
-                else:
-                    weight_multiplier = 1.00 # 平常時はフル (20%)
-
-                # 1銘柄あたりの最大許容投資額
-                max_alloc_per_trade = current_portfolio_value * (base_weight * weight_multiplier)
-                
+                # 資金管理を元に戻す（常にフルパワーで勝負し、1000%の利益を狙う）
                 for score, ticker, limit_p in candidates[:open_slots]:
-                    # 残りキャッシュの等分と、最大許容投資額の小さい方を採用
-                    target_alloc = min(cash / open_slots, max_alloc_per_trade)
+                    target_alloc = cash / open_slots
                     pending_orders.append({
                         'ticker': ticker,
                         'limit_price': limit_p,
@@ -396,7 +386,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Volatility Sizing Logic...")
+    debug_log("Running integrity and edge-case tests for Sniper Defense Logic...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -429,7 +419,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (VOLATILITY SIZING VER.)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (SNIPER DEFENSE VER.)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -439,7 +429,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Final Sizing Optimized)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Sniper Defense)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -453,7 +443,7 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 VIX連動資金管理 分析レポート")
+        print(f" 🔬 スナイパー・ディフェンス 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f"     ┗ 危険な窓開け回避(注文キャンセル): {st['gap_down_cancels']} 回")
         print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
