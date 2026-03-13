@@ -194,7 +194,7 @@ class PortfolioBacktester:
             'limit_placed': 0, 'limit_exec': 0,
             'time_stops': 0, 'time_stop_wins': 0,
             'hard_stops': 0, 'trailing_stops': 0,
-            'gap_down_cancels': 0  # ペナルティではなくキャンセル回数を記録
+            'gap_down_cancels': 0 
         }
         
         debug_log("Loading and calculating indicators for all tickers...")
@@ -246,16 +246,12 @@ class PortfolioBacktester:
                     
                     self.stats['limit_placed'] += 1
                     
-                    # 【真のディフェンス】寄り付きが指値を下回った場合、悪材料と判断して注文キャンセル
                     if open_p < limit_p:
                         self.stats['gap_down_cancels'] += 1
-                        continue # エントリーを見送る
+                        continue 
                         
                     if low_p <= limit_p:
-                        exec_price = limit_p
-                        # 現実的ストレス：エントリー時スリッページ・手数料 (0.2%不利に約定)
-                        exec_price = exec_price * 1.002
-                        
+                        exec_price = limit_p * 1.002
                         alloc_cash = order['allocated_cash']
                         qty = alloc_cash // exec_price
                         
@@ -301,7 +297,6 @@ class PortfolioBacktester:
                     if r_mult >= 4.0 and not pos['took_3r']:
                         sell_qty = int(pos['qty'] // 2)
                         if sell_qty > 0:
-                            # 現実的ストレス：エグジット時スリッページ・手数料 (0.2%不利に利確)
                             cash += sell_qty * (curr_c * 0.998)
                             pos['qty'] -= sell_qty
                             total_trades += 1
@@ -316,7 +311,6 @@ class PortfolioBacktester:
                         pos['took_2r'] = True
 
                 if exit_score >= 80:
-                    # 現実的ストレス：全決済時のスリッページ
                     cash += pos['qty'] * (curr_c * 0.998)
                     total_trades += 1
                     closed_tickers.append(ticker)
@@ -337,8 +331,31 @@ class PortfolioBacktester:
                 
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 
+                # ==========================================
+                # 【最終ディフェンス】ポートフォリオ評価額に基づくVIX連動資金管理
+                # ==========================================
+                current_portfolio_value = cash
+                for tk, pos in positions.items():
+                    if tk in today_market:
+                        current_portfolio_value += pos['qty'] * (AdvancedStrategyAnalyzer._to_float(today_market[tk].get('close', pos['entry_p'])) * 0.998)
+                    else:
+                        current_portfolio_value += pos['qty'] * pos['entry_p']
+
+                # VIXによる投資比率の動的コントロール
+                base_weight = 1.0 / self.max_positions # 基本20%
+                if vix >= 25.0:
+                    weight_multiplier = 0.50 # パニック時は半額 (10%)
+                elif vix >= 20.0:
+                    weight_multiplier = 0.75 # 警戒時は縮小 (15%)
+                else:
+                    weight_multiplier = 1.00 # 平常時はフル (20%)
+
+                # 1銘柄あたりの最大許容投資額
+                max_alloc_per_trade = current_portfolio_value * (base_weight * weight_multiplier)
+                
                 for score, ticker, limit_p in candidates[:open_slots]:
-                    target_alloc = cash / open_slots
+                    # 残りキャッシュの等分と、最大許容投資額の小さい方を採用
+                    target_alloc = min(cash / open_slots, max_alloc_per_trade)
                     pending_orders.append({
                         'ticker': ticker,
                         'limit_price': limit_p,
@@ -350,7 +367,6 @@ class PortfolioBacktester:
             for ticker, pos in positions.items():
                 if ticker in today_market:
                     curr_c = AdvancedStrategyAnalyzer._to_float(today_market[ticker].get('close', pos['entry_p']))
-                    # 日々の資産評価額も0.2%スリッページ込みで計算し、ドローダウンを厳しめに見積もる
                     daily_equity += pos['qty'] * (curr_c * 0.998)
             equity_curve.append(daily_equity)
 
@@ -380,7 +396,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Real-World Avoidance Logic...")
+    debug_log("Running integrity and edge-case tests for Volatility Sizing Logic...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -413,7 +429,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (GAP AVOIDANCE VER.)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (VOLATILITY SIZING VER.)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -423,7 +439,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Gap Down Avoidance)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Final Sizing Optimized)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -437,7 +453,7 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 窓開け回避ストレステスト 分析レポート")
+        print(f" 🔬 VIX連動資金管理 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f"     ┗ 危険な窓開け回避(注文キャンセル): {st['gap_down_cancels']} 回")
         print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
