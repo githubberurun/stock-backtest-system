@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 大型株専用・統合分析エンジン (実運用ディフェンス最適化版)
+# 1. 大型株専用・統合分析エンジン (攻守両立・レジームスイッチ搭載版)
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -74,7 +74,6 @@ class AdvancedStrategyAnalyzer:
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
         df['rsi_slope'] = df['rsi'] - df['rsi'].shift(5)
         
-        # ボラティリティ（ATRとTrue Range）の正確な計算
         tr = pd.concat([
             (df['high'] - df['low']), 
             (df['high'] - df['close'].shift()).abs(), 
@@ -101,69 +100,51 @@ class AdvancedStrategyAnalyzer:
         return df
 
     @staticmethod
-    def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float, vix_pct: float) -> Tuple[bool, float]:
+    def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 【アップデート①】VIX動的ショック検知（暴落初動の回避）
-        # VIXが極端に高い(25以上)、またはVIXが18以上で前日比+15%以上急騰した日はパニック相場とみなして見送り
-        if n_chg <= -2.5 or vix >= 25.0 or (vix >= 18.0 and vix_pct >= 15.0):
+        # 【守り】制御不能な歴史的パニック(VIX 35超)や強烈な下落幅の時は物理的に停止
+        if n_chg <= -3.0 or vix >= 35.0:
             return False, 0.0
             
-        # 【アップデート②】異常ボラティリティ（落ちるナイフ）の物理的排除
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
+        # 【守り】異常なボラティリティ（悪材料によるストップ安等）の回避
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
-            return False, 0.0 # 平時の2.5倍以上の値幅が出た日は、悪材料の可能性が高いためスルー
+            return False, 0.0 
         
+        bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
+        bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
         curr_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
-        prev_c = AdvancedStrategyAnalyzer._to_float(row_dict.get('prev_close', 0.0))
         rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0), 50.0)
-        dev25_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('dev25', 0.0), 0.0)
         rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0), 0.0)
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
-        
-        m25 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma25', 0.0))
-        m75 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma75', 0.0))
-        m200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma200', 0.0))
-        bb_width = AdvancedStrategyAnalyzer._to_float(row_dict.get('bb_width', 1.0))
-        rsi_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi_slope', 0.0))
         is_bullish = bool(row_dict.get('is_bullish', False))
 
-        main_score = 0.0
-        if attr == "押し目":
-            is_uptrend = (m75 > m200) and (curr_c > m200)
-            if is_uptrend:
-                if curr_c < m25 and rsi_val <= 35 and vol_ratio < 0.8: main_score += 100
-                elif curr_c < m25 and rsi_val <= 45 and vol_ratio <= 1.0: main_score += 60
-                if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 40
+        # ==========================================
+        # 【攻守両立】レジーム・スイッチング判定
+        # ==========================================
+        is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
+
+        if is_bear_market:
+            # 暴落相場：パニック売りの極致のみを狙う（V字回復狙い）
+            if rsi_val > 30.0 or vol_ratio < 1.5:
+                return False, 0.0
+            total_score = 90.0 # 条件を満たせば無条件で高スコア
         else:
-            if vol_ratio >= 2.0: main_score += 40
-            elif vol_ratio >= 1.5: main_score += 20
-            if 50 <= rsi_val <= 75: main_score += 15
-            elif 75 < rsi_val <= 85: main_score += 5
-            elif rsi_val > 85 and curr_c < prev_c: main_score -= 10
-            if rsi_slope >= 10.0: main_score += 20
-            if 0 < dev25_val <= 20: main_score += 15
-            elif dev25_val > 20: main_score += 5
-            if bb_width <= 0.10 and vol_ratio <= 0.8: main_score += 20
-            
-            if rsi_val < 30.0 and is_bullish:
-                main_score += 50.0 
+            # 平常相場：相対強度がプラスの銘柄のみを狙う（順張りベースの押し目）
+            if rs_21_val < 0.0:
+                return False, 0.0
                 
-            main_score += 30 
+            # スコアリングロジック（平常時用）
+            main_score = 30.0
+            if vol_ratio >= 1.5: main_score += 20
+            if 50 <= rsi_val <= 75: main_score += 15
+            elif rsi_val < 40: main_score += 20
             
-        surrogate_base = min(100.0, main_score)
-        mock_fin_score, mock_appear_count = 3.0, 3.0
-        tech_penalty = (20.0 if rsi_val > 80 else 0) + (15.0 if dev25_val > 20 else 0)
-        
-        total_score = (surrogate_base * 0.7) + (mock_fin_score * 3) + (mock_appear_count * 2) - tech_penalty 
-        total_score = min(100.0, max(0.0, float(total_score)))
-        
-        rebound_triggered = (rsi_val < 30.0 and is_bullish)
-        
-        # エントリー閾値の最適化
-        is_entry = (total_score >= 80) if attr == "押し目" else (total_score >= 80 and (rs_21_val > -1.0 or rebound_triggered))
-        
+            total_score = main_score + 30.0 # 簡易ベース加算
+            
+        is_entry = (total_score >= 80)
         return is_entry, float(total_score)
 
     @staticmethod
@@ -172,9 +153,9 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # 指値を 0.3ATR から 0.2ATR へ浅くし、本物の反発を取り逃がさないようにする
-        base_offset = 0.5 if "中長期" in attr else (0.0 if attr == "押し目" else 0.2)
-        nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -0.8 else 0.0
+        # パニック売りを拾いやすくするため、指値は浅め(0.1ATR)に設定
+        base_offset = 0.1 
+        nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -1.0 else 0.0
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price))
 
@@ -190,27 +171,23 @@ class USMarketCache:
             if not ndx_data.empty and not vix_data.empty:
                 self.ndx = ndx_data['Close'].pct_change() * 100
                 self.vix = vix_data['Close']
-                self.vix_pct = vix_data['Close'].pct_change() * 100 # VIXの前日比を計算
                 
                 self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
                 self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
-                self.vix_pct.index = self.vix_pct.index.tz_localize(None).strftime('%Y-%m-%d')
             else:
-                self.ndx, self.vix, self.vix_pct = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+                self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
         except Exception:
-            self.ndx, self.vix, self.vix_pct = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+            self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
 
-    def get_state(self, date_str: str) -> Tuple[float, float, float]:
+    def get_state(self, date_str: str) -> Tuple[float, float]:
         if not isinstance(date_str, str): raise TypeError("date_str must be string")
-        if self.ndx.empty or self.vix.empty: return 0.0, 15.0, 0.0
+        if self.ndx.empty or self.vix.empty: return 0.0, 15.0
         dt = datetime.strptime(date_str, '%Y-%m-%d')
         for i in range(1, 6):
             prev = (dt - timedelta(days=i)).strftime('%Y-%m-%d')
             if prev in self.ndx.index and prev in self.vix.index: 
-                vix_val = float(self.vix[prev])
-                vix_pct_val = float(self.vix_pct[prev]) if pd.notna(self.vix_pct[prev]) else 0.0
-                return float(self.ndx[prev]), vix_val, vix_pct_val
-        return 0.0, 15.0, 0.0
+                return float(self.ndx[prev]), float(self.vix[prev])
+        return 0.0, 15.0
 
 class PortfolioBacktester:
     def __init__(self, data_dir: str, initial_cash: float = 1000000.0, max_positions: int = 5) -> None:
@@ -224,7 +201,7 @@ class PortfolioBacktester:
         self.stats = {
             'limit_placed': 0, 'limit_exec': 0,
             'time_stops': 0, 'time_stop_wins': 0,
-            'climax_sells': 0
+            'hard_stops': 0, 'trailing_stops': 0
         }
         
         debug_log("Loading and calculating indicators for all tickers...")
@@ -263,7 +240,7 @@ class PortfolioBacktester:
 
         for date_str in self.sorted_dates:
             today_market = self.timeline[date_str]
-            n_chg, vix, vix_pct = self.us_market.get_state(date_str)
+            n_chg, vix = self.us_market.get_state(date_str)
             
             new_pending = []
             for order in pending_orders:
@@ -298,37 +275,34 @@ class PortfolioBacktester:
                 
                 curr_c = AdvancedStrategyAnalyzer._to_float(row.get('close', 0.0))
                 current_atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 0.0))
-                dev25_val = AdvancedStrategyAnalyzer._to_float(row.get('dev25', 0.0))
-                rsi_val = AdvancedStrategyAnalyzer._to_float(row.get('rsi', 50.0))
-                vol_ratio = AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 1.0))
                 
                 pos['days_held'] += 1
                 pos['high_p'] = max(pos['high_p'], curr_c)
-                
                 exit_score = 0
                 
-                # トレイリングストップ (標準的な 2.5ATR に戻し、MDDを抑える)
-                atr_mult = 2.5 
-                ch_stop = max(pos['high_p'] - (current_atr * atr_mult), pos['entry_p'] - (current_atr * atr_mult))
+                # ==========================================
+                # エグジット戦略 (絶対防衛線の実装)
+                # ==========================================
                 
-                if curr_c < ch_stop: exit_score += 100 
-                if dev25_val > 20.0 and rsi_val > 85.0 and vol_ratio > 2.0: 
-                    exit_score += 100 
-                    self.stats['climax_sells'] += 1
-                    
-                # 【アップデート③】タイムストップのスイートスポット (15日)
-                if pos['days_held'] >= 15 and curr_c < (pos['entry_p'] * 1.02): 
+                # 1. ハードストップ (初期エントリーから2.0ATR逆行で強制終了)
+                hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
+                if curr_c <= hard_stop_price:
+                    exit_score += 100
+                    self.stats['hard_stops'] += 1
+                
+                # 2. トレイリングストップ (最高値から2.5ATR逆行で利確/損切)
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
+                if curr_c <= trailing_stop_price and exit_score == 0:
+                    exit_score += 100
+                    self.stats['trailing_stops'] += 1
+                
+                # 3. タイムストップ (資金拘束の解除: 15日)
+                if pos['days_held'] >= 15 and curr_c < (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
                     if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
 
-                if bool(row.get('bb_3_reversal', False)): exit_score += 40
-                if bool(row.get('bb_p1_cross_down', False)): exit_score += 20
-                if AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('ma25', 0)) and vol_ratio >= 1.0: exit_score += 15
-                if AdvancedStrategyAnalyzer._to_float(row.get('macd', 0)) < AdvancedStrategyAnalyzer._to_float(row.get('sig', 0)) and vol_ratio >= 1.0: exit_score += 15
-                if AdvancedStrategyAnalyzer._to_float(row.get('rs', 0)) < -5: exit_score += 5
-
-                # 【アップデート③】黄金比の分割利確 (2.5倍と4.0倍)
+                # 分割利確 (攻め: 2.5ATR / 4.0ATR)
                 if current_atr > 0 and curr_c > pos['entry_p'] and exit_score < 80:
                     r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
                     if r_mult >= 4.0 and not pos['took_3r']:
@@ -361,7 +335,7 @@ class PortfolioBacktester:
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
-                    is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix, vix_pct)
+                    is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix)
                     if is_entry:
                         limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(row, self.attr, n_chg)
                         candidates.append((score, ticker, limit_p))
@@ -410,23 +384,22 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Real-World Optimized logic...")
+    debug_log("Running integrity and edge-case tests for Regime Switching Logic...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
     
-    # 異常値の型チェックテスト
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
-        is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0, 0.0)
+        is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
         assert isinstance(score, float), "Corrupted data should be processed safely into a float score."
         assert is_entry is False, "Corrupted data should not trigger an entry."
     except Exception as e:
         raise AssertionError(f"Failed to handle corrupted data safely: {e}")
         
     try:
-        AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0, 0.0) # type: ignore
+        AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0) # type: ignore
         assert False, "evaluate_entry should raise TypeError for non-dict input"
     except TypeError:
         pass
@@ -442,7 +415,7 @@ if __name__ == "__main__":
             exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (REAL-WORLD OPTIMIZED)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (REGIME SWITCHING)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -452,7 +425,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Real-World Defense Optimized)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Regime Switching & Defense)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -466,10 +439,11 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 実運用向け最適化 分析レポート")
+        print(f" 🔬 レジーム・スイッチング 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
-        print(f" [3] クライマックス売り発動: {st['climax_sells']} 回")
+        print(f" [3] ハードストップ(絶対防衛線): {st['hard_stops']} 回")
+        print(f" [4] トレイリングストップ発動: {st['trailing_stops']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
