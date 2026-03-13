@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 大型株専用・統合分析エンジン (動的極深指値ハイブリッド版)
+# 1. 大型株専用・統合分析エンジン
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -194,7 +194,7 @@ class PortfolioBacktester:
             'limit_placed': 0, 'limit_exec': 0,
             'time_stops': 0, 'time_stop_wins': 0,
             'hard_stops': 0, 'trailing_stops': 0,
-            'gap_down_penalties': 0
+            'gap_down_cancels': 0  # ペナルティではなくキャンセル回数を記録
         }
         
         debug_log("Loading and calculating indicators for all tickers...")
@@ -242,21 +242,18 @@ class PortfolioBacktester:
                     row = today_market[ticker]
                     low_p = AdvancedStrategyAnalyzer._to_float(row.get('low', 0.0))
                     open_p = AdvancedStrategyAnalyzer._to_float(row.get('open', 0.0))
-                    high_p = AdvancedStrategyAnalyzer._to_float(row.get('high', 0.0))
-                    current_atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 0.0))
                     limit_p = order['limit_price']
                     
                     self.stats['limit_placed'] += 1
                     
-                    if low_p <= limit_p:
-                        # 【ストレス付与①】窓開け暴落ペナルティ
-                        if open_p < limit_p:
-                            exec_price = min(open_p + (current_atr * 0.5), high_p)
-                            self.stats['gap_down_penalties'] += 1
-                        else:
-                            exec_price = limit_p
+                    # 【真のディフェンス】寄り付きが指値を下回った場合、悪材料と判断して注文キャンセル
+                    if open_p < limit_p:
+                        self.stats['gap_down_cancels'] += 1
+                        continue # エントリーを見送る
                         
-                        # 【ストレス付与②】エントリー時スリッページ・手数料 (0.2%不利に約定)
+                    if low_p <= limit_p:
+                        exec_price = limit_p
+                        # 現実的ストレス：エントリー時スリッページ・手数料 (0.2%不利に約定)
                         exec_price = exec_price * 1.002
                         
                         alloc_cash = order['allocated_cash']
@@ -304,7 +301,7 @@ class PortfolioBacktester:
                     if r_mult >= 4.0 and not pos['took_3r']:
                         sell_qty = int(pos['qty'] // 2)
                         if sell_qty > 0:
-                            # 【ストレス付与②】エグジット時スリッページ・手数料 (0.2%不利に利確)
+                            # 現実的ストレス：エグジット時スリッページ・手数料 (0.2%不利に利確)
                             cash += sell_qty * (curr_c * 0.998)
                             pos['qty'] -= sell_qty
                             total_trades += 1
@@ -319,7 +316,7 @@ class PortfolioBacktester:
                         pos['took_2r'] = True
 
                 if exit_score >= 80:
-                    # 【ストレス付与②】全決済時のスリッページ
+                    # 現実的ストレス：全決済時のスリッページ
                     cash += pos['qty'] * (curr_c * 0.998)
                     total_trades += 1
                     closed_tickers.append(ticker)
@@ -383,7 +380,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Real-World Stress Test Logic...")
+    debug_log("Running integrity and edge-case tests for Real-World Avoidance Logic...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -408,7 +405,6 @@ def run_integrity_tests() -> None:
 if __name__ == "__main__":
     run_integrity_tests()
     try:
-        # ランナー環境に応じてデータディレクトリを自動選択するフォールバック処理
         data_dir = "Colog_github"
         if not os.path.exists(data_dir):
             data_dir = "data"
@@ -417,7 +413,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (STRESS TEST VER.)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (GAP AVOIDANCE VER.)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -427,7 +423,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Real-World Stress Test)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Gap Down Avoidance)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -441,9 +437,9 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 過酷ストレステスト 分析レポート")
+        print(f" 🔬 窓開け回避ストレステスト 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
-        print(f"     ┗ 窓開けペナルティ発動: {st['gap_down_penalties']} 回 (約定時の不利なスリッページ)")
+        print(f"     ┗ 危険な窓開け回避(注文キャンセル): {st['gap_down_cancels']} 回")
         print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
         print(f" [3] ハードストップ(絶対防衛線): {st['hard_stops']} 回")
         print(f" [4] トレイリングストップ発動: {st['trailing_stops']} 回")
