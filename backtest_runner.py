@@ -103,13 +103,11 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # マクロ制御（制御不能なパニックは完全フリーズ）
         if n_chg <= -3.0 or vix >= 35.0:
             return False, 0.0, False
             
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
-        # 異常ボラティリティ（悪材料のストップ安など）は排除
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
             return False, 0.0, False
         
@@ -122,7 +120,6 @@ class AdvancedStrategyAnalyzer:
         
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
 
-        # 486%を叩き出した「陽線縛りのない無条件エントリー」に戻す
         if is_bear_market:
             if rsi_val > 30.0 or vol_ratio < 1.5:
                 return False, 0.0, is_bear_market
@@ -145,8 +142,6 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # 【最大のディフェンス改修】指値の動的深化 (Dynamic Limit Depth)
-        # 暴落相場や高VIX時は「1.2ATRの極深ディスカウント」を要求し、安全地帯のみで拾う
         if is_bear_market or vix >= 20.0:
             base_offset = 1.2
         else:
@@ -198,7 +193,8 @@ class PortfolioBacktester:
         self.stats = {
             'limit_placed': 0, 'limit_exec': 0,
             'time_stops': 0, 'time_stop_wins': 0,
-            'hard_stops': 0, 'trailing_stops': 0
+            'hard_stops': 0, 'trailing_stops': 0,
+            'gap_down_penalties': 0
         }
         
         debug_log("Loading and calculating indicators for all tickers...")
@@ -246,12 +242,23 @@ class PortfolioBacktester:
                     row = today_market[ticker]
                     low_p = AdvancedStrategyAnalyzer._to_float(row.get('low', 0.0))
                     open_p = AdvancedStrategyAnalyzer._to_float(row.get('open', 0.0))
+                    high_p = AdvancedStrategyAnalyzer._to_float(row.get('high', 0.0))
+                    current_atr = AdvancedStrategyAnalyzer._to_float(row.get('atr', 0.0))
                     limit_p = order['limit_price']
                     
                     self.stats['limit_placed'] += 1
                     
                     if low_p <= limit_p:
-                        exec_price = min(open_p, limit_p)
+                        # 【ストレス付与①】窓開け暴落ペナルティ
+                        if open_p < limit_p:
+                            exec_price = min(open_p + (current_atr * 0.5), high_p)
+                            self.stats['gap_down_penalties'] += 1
+                        else:
+                            exec_price = limit_p
+                        
+                        # 【ストレス付与②】エントリー時スリッページ・手数料 (0.2%不利に約定)
+                        exec_price = exec_price * 1.002
+                        
                         alloc_cash = order['allocated_cash']
                         qty = alloc_cash // exec_price
                         
@@ -277,7 +284,6 @@ class PortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                # 486%を叩き出した「2.0ATRハードストップ」の復元（揺さぶりに耐える）
                 hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
                 if curr_c <= hard_stop_price:
                     exit_score += 100
@@ -298,7 +304,8 @@ class PortfolioBacktester:
                     if r_mult >= 4.0 and not pos['took_3r']:
                         sell_qty = int(pos['qty'] // 2)
                         if sell_qty > 0:
-                            cash += sell_qty * curr_c
+                            # 【ストレス付与②】エグジット時スリッページ・手数料 (0.2%不利に利確)
+                            cash += sell_qty * (curr_c * 0.998)
                             pos['qty'] -= sell_qty
                             total_trades += 1
                         pos['took_3r'] = True
@@ -306,13 +313,14 @@ class PortfolioBacktester:
                     elif r_mult >= 2.5 and not pos['took_2r']:
                         sell_qty = int(pos['qty'] // 3)
                         if sell_qty > 0:
-                            cash += sell_qty * curr_c
+                            cash += sell_qty * (curr_c * 0.998)
                             pos['qty'] -= sell_qty
                             total_trades += 1
                         pos['took_2r'] = True
 
                 if exit_score >= 80:
-                    cash += pos['qty'] * curr_c
+                    # 【ストレス付与②】全決済時のスリッページ
+                    cash += pos['qty'] * (curr_c * 0.998)
                     total_trades += 1
                     closed_tickers.append(ticker)
 
@@ -325,7 +333,6 @@ class PortfolioBacktester:
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
-                    # 戻り値に `is_bear` を追加して指値計算へ引き継ぐ
                     is_entry, score, is_bear = AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix)
                     if is_entry:
                         limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(row, self.attr, n_chg, is_bear, vix)
@@ -346,7 +353,8 @@ class PortfolioBacktester:
             for ticker, pos in positions.items():
                 if ticker in today_market:
                     curr_c = AdvancedStrategyAnalyzer._to_float(today_market[ticker].get('close', pos['entry_p']))
-                    daily_equity += pos['qty'] * curr_c
+                    # 日々の資産評価額も0.2%スリッページ込みで計算し、ドローダウンを厳しめに見積もる
+                    daily_equity += pos['qty'] * (curr_c * 0.998)
             equity_curve.append(daily_equity)
 
         final_equity = equity_curve[-1] if equity_curve else self.initial_cash
@@ -375,7 +383,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Dynamic Limit Depth Logic...")
+    debug_log("Running integrity and edge-case tests for Real-World Stress Test Logic...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -400,13 +408,14 @@ def run_integrity_tests() -> None:
 if __name__ == "__main__":
     run_integrity_tests()
     try:
-        data_dir = "data"
+        # ご指定のディレクトリ構成に適応
+        data_dir = "Colog_github"
         if not os.path.exists(data_dir):
             print(f"[ERROR] Directory '{data_dir}' not found. Please run data_fetcher.py first.")
             exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (DYNAMIC LIMIT DEPTH)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (STRESS TEST VER.)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -416,7 +425,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Dynamic Limit Depth)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Real-World Stress Test)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -430,8 +439,9 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 動的極深指値ハイブリッド版 分析レポート")
+        print(f" 🔬 過酷ストレステスト 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
+        print(f"     ┗ 窓開けペナルティ発動: {st['gap_down_penalties']} 回 (約定時の不利なスリッページ)")
         print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
         print(f" [3] ハードストップ(絶対防衛線): {st['hard_stops']} 回")
         print(f" [4] トレイリングストップ発動: {st['trailing_stops']} 回")
