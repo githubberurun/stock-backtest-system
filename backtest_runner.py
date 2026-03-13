@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 大型株専用・統合分析エンジン (スナイパー・ディフェンス版)
+# 1. 大型株専用・統合分析エンジン (黄金比ロジック復元)
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -103,13 +103,12 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # マクロ危機回避 (VIX 35超えは回避)
-        if n_chg <= -3.0 or vix >= 35.0:
+        # マクロフィルター: ナスダックが-2.5%以上の歴史的大暴落の日は拾わない
+        if n_chg <= -2.5 or vix >= 33.0:
             return False, 0.0, False
             
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
-        # 異常ボラティリティ（悪材料のストップ安など）は排除
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
             return False, 0.0, False
         
@@ -122,14 +121,12 @@ class AdvancedStrategyAnalyzer:
         
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
 
+        # 1048%を叩き出した最も優れたバランスへ復元
         if is_bear_market:
-            # 【ディフェンス改修①】スナイパー・フィルター（超厳格なキャピチュレーション判定）
-            # RSI 25以下 かつ 出来高2.0倍以上（真のパニック時のみエントリー）
-            if rsi_val > 25.0 or vol_ratio < 2.0:
+            if rsi_val > 30.0 or vol_ratio < 1.5:
                 return False, 0.0, is_bear_market
             total_score = 90.0
         else:
-            # ブル相場は引き続き強い銘柄の押し目を狙う
             if rs_21_val < 0.0:
                 return False, 0.0, is_bear_market
             main_score = 30.0
@@ -147,10 +144,9 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # 【ディフェンス改修②】限界突破の極深指値
-        # VIXが25以上の大パニック時は1.5ATR下という「絶対安全圏」でしか買わない
+        # 黄金比：ベア相場やVIX高の時は「1.2ATR下」で拾う
         if is_bear_market or vix >= 20.0:
-            base_offset = 1.5 if vix >= 25.0 else 1.2
+            base_offset = 1.2
         else:
             base_offset = 0.1
             
@@ -253,13 +249,14 @@ class PortfolioBacktester:
                     
                     self.stats['limit_placed'] += 1
                     
-                    # 窓開けキャンセル（超重要ディフェンス）
+                    # 窓開けキャンセル（強力なディフェンス機能は継続）
                     if open_p < limit_p:
                         self.stats['gap_down_cancels'] += 1
                         continue 
                         
                     if low_p <= limit_p:
-                        exec_price = limit_p * 1.002 # エントリー時0.2%スリッページ
+                        # 0.2%のスリッページ・手数料ペナルティを付与
+                        exec_price = limit_p * 1.002 
                         
                         alloc_cash = order['allocated_cash']
                         qty = alloc_cash // exec_price
@@ -286,14 +283,22 @@ class PortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
+                # ==========================================
+                # 【MDD改善の切り札】絶対損失キャップ (Max Loss Cap)
+                # ==========================================
+                # ATRの拡大による致命傷を防ぐため、「買値から15%」で物理的に損切りを掛ける
+                hard_stop_price_atr = pos['entry_p'] - (current_atr * 2.0)
+                hard_stop_price_abs = pos['entry_p'] * 0.85 # -15%の絶対防衛線
+                
+                # より浅い(安全な)方を採用
+                hard_stop_price = max(hard_stop_price_atr, hard_stop_price_abs)
+                
                 if curr_c <= hard_stop_price:
                     exit_score += 100
                     self.stats['hard_stops'] += 1
                 
-                # 【ディフェンス改修③】トレイリングストップのタイト化 (2.5 -> 2.0)
-                # 高値から2.0ATR下落したら利益を高速でロックインする
-                trailing_stop_price = pos['high_p'] - (current_atr * 2.0)
+                # トレイリングストップは黄金比の 2.5ATR に復元
+                trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
@@ -322,7 +327,6 @@ class PortfolioBacktester:
                         pos['took_2r'] = True
 
                 if exit_score >= 80:
-                    # エグジット時0.2%スリッページ
                     cash += pos['qty'] * (curr_c * 0.998)
                     total_trades += 1
                     closed_tickers.append(ticker)
@@ -343,7 +347,6 @@ class PortfolioBacktester:
                 
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 
-                # 資金管理を元に戻す（常にフルパワーで勝負し、1000%の利益を狙う）
                 for score, ticker, limit_p in candidates[:open_slots]:
                     target_alloc = cash / open_slots
                     pending_orders.append({
@@ -386,7 +389,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Sniper Defense Logic...")
+    debug_log("Running integrity and edge-case tests for Absolute Loss Cap Logic...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -419,7 +422,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (SNIPER DEFENSE VER.)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (MAX LOSS CAP VER.)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -429,7 +432,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Sniper Defense)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max Loss Cap Optimized)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -443,7 +446,7 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 スナイパー・ディフェンス 分析レポート")
+        print(f" 🔬 絶対損失上限 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f"     ┗ 危険な窓開け回避(注文キャンセル): {st['gap_down_cancels']} 回")
         print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
