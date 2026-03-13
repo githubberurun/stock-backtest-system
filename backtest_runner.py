@@ -17,7 +17,7 @@ def debug_log(msg: str) -> None:
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # ==========================================
-# 1. 大型株専用・統合分析エンジン (ディフェンス完成版)
+# 1. 大型株専用・統合分析エンジン (動的極深指値ハイブリッド版)
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -56,7 +56,6 @@ class AdvancedStrategyAnalyzer:
         df['ma200'] = df['close'].rolling(window=200).mean()
         df['bb_width'] = np.where(df['ma20'] > 0, (df['std20'] * 4) / df['ma20'], 0)
         
-        # 陽線判定（反発確認の必須条件）
         df['is_bullish'] = df['close'] > df['open']
         
         df['was_above_bb_p1'] = (df['high'] >= df['bb_p1']).rolling(window=5).max() > 0
@@ -101,17 +100,18 @@ class AdvancedStrategyAnalyzer:
         return df
 
     @staticmethod
-    def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float, vix_pct: float) -> Tuple[bool, float]:
+    def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 【ディフェンス強化②】VIX急騰（前日比+15%以上）のパニック日は無条件で買い停止
-        if n_chg <= -3.0 or vix >= 35.0 or (vix >= 18.0 and vix_pct >= 15.0):
-            return False, 0.0
+        # マクロ制御（制御不能なパニックは完全フリーズ）
+        if n_chg <= -3.0 or vix >= 35.0:
+            return False, 0.0, False
             
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
+        # 異常ボラティリティ（悪材料のストップ安など）は排除
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
-            return False, 0.0 
+            return False, 0.0, False
         
         bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
         bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
@@ -119,39 +119,39 @@ class AdvancedStrategyAnalyzer:
         rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0), 50.0)
         rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0), 0.0)
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
-        is_bullish = bool(row_dict.get('is_bullish', False))
-
-        # ==========================================
-        # 【攻守両立】レジーム・スイッチング判定
-        # ==========================================
+        
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
 
+        # 486%を叩き出した「陽線縛りのない無条件エントリー」に戻す
         if is_bear_market:
-            # 【ディフェンス強化①】暴落相場では、必ず「陽線（反発初動）」を確認してから拾う
-            if rsi_val > 30.0 or vol_ratio < 1.5 or not is_bullish:
-                return False, 0.0
+            if rsi_val > 30.0 or vol_ratio < 1.5:
+                return False, 0.0, is_bear_market
             total_score = 90.0
         else:
             if rs_21_val < 0.0:
-                return False, 0.0
-                
+                return False, 0.0, is_bear_market
             main_score = 30.0
             if vol_ratio >= 1.5: main_score += 20
             if 50 <= rsi_val <= 75: main_score += 15
             elif rsi_val < 40: main_score += 20
-            
             total_score = main_score + 30.0
             
         is_entry = (total_score >= 80)
-        return is_entry, float(total_score)
+        return is_entry, float(total_score), is_bear_market
 
     @staticmethod
-    def calculate_limit_price(row_dict: Dict[str, Any], attr: str, n_chg: float) -> float:
+    def calculate_limit_price(row_dict: Dict[str, Any], attr: str, n_chg: float, is_bear_market: bool, vix: float) -> float:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        base_offset = 0.1 
+        # 【最大のディフェンス改修】指値の動的深化 (Dynamic Limit Depth)
+        # 暴落相場や高VIX時は「1.2ATRの極深ディスカウント」を要求し、安全地帯のみで拾う
+        if is_bear_market or vix >= 20.0:
+            base_offset = 1.2
+        else:
+            base_offset = 0.1
+            
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -1.0 else 0.0
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price))
@@ -168,27 +168,23 @@ class USMarketCache:
             if not ndx_data.empty and not vix_data.empty:
                 self.ndx = ndx_data['Close'].pct_change() * 100
                 self.vix = vix_data['Close']
-                self.vix_pct = vix_data['Close'].pct_change() * 100
                 
                 self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
                 self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
-                self.vix_pct.index = self.vix_pct.index.tz_localize(None).strftime('%Y-%m-%d')
             else:
-                self.ndx, self.vix, self.vix_pct = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+                self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
         except Exception:
-            self.ndx, self.vix, self.vix_pct = pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+            self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
 
-    def get_state(self, date_str: str) -> Tuple[float, float, float]:
+    def get_state(self, date_str: str) -> Tuple[float, float]:
         if not isinstance(date_str, str): raise TypeError("date_str must be string")
-        if self.ndx.empty or self.vix.empty: return 0.0, 15.0, 0.0
+        if self.ndx.empty or self.vix.empty: return 0.0, 15.0
         dt = datetime.strptime(date_str, '%Y-%m-%d')
         for i in range(1, 6):
             prev = (dt - timedelta(days=i)).strftime('%Y-%m-%d')
             if prev in self.ndx.index and prev in self.vix.index: 
-                vix_val = float(self.vix[prev])
-                vix_pct_val = float(self.vix_pct[prev]) if pd.notna(self.vix_pct[prev]) else 0.0
-                return float(self.ndx[prev]), vix_val, vix_pct_val
-        return 0.0, 15.0, 0.0
+                return float(self.ndx[prev]), float(self.vix[prev])
+        return 0.0, 15.0
 
 class PortfolioBacktester:
     def __init__(self, data_dir: str, initial_cash: float = 1000000.0, max_positions: int = 5) -> None:
@@ -241,7 +237,7 @@ class PortfolioBacktester:
 
         for date_str in self.sorted_dates:
             today_market = self.timeline[date_str]
-            n_chg, vix, vix_pct = self.us_market.get_state(date_str)
+            n_chg, vix = self.us_market.get_state(date_str)
             
             new_pending = []
             for order in pending_orders:
@@ -281,12 +277,8 @@ class PortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                # ==========================================
-                # エグジット戦略 (ディフェンス強化)
-                # ==========================================
-                
-                # 【ディフェンス強化③】ハードストップのタイト化 (2.0ATR -> 1.5ATR)
-                hard_stop_price = pos['entry_p'] - (current_atr * 1.5)
+                # 486%を叩き出した「2.0ATRハードストップ」の復元（揺さぶりに耐える）
+                hard_stop_price = pos['entry_p'] - (current_atr * 2.0)
                 if curr_c <= hard_stop_price:
                     exit_score += 100
                     self.stats['hard_stops'] += 1
@@ -333,9 +325,10 @@ class PortfolioBacktester:
                 for ticker, row in today_market.items():
                     if ticker in positions: continue 
                     
-                    is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix, vix_pct)
+                    # 戻り値に `is_bear` を追加して指値計算へ引き継ぐ
+                    is_entry, score, is_bear = AdvancedStrategyAnalyzer.evaluate_entry(row, self.attr, n_chg, vix)
                     if is_entry:
-                        limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(row, self.attr, n_chg)
+                        limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(row, self.attr, n_chg, is_bear, vix)
                         candidates.append((score, ticker, limit_p))
                 
                 candidates.sort(key=lambda x: x[0], reverse=True)
@@ -382,7 +375,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Defensive Regime Logic...")
+    debug_log("Running integrity and edge-case tests for Dynamic Limit Depth Logic...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -390,14 +383,14 @@ def run_integrity_tests() -> None:
     
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
-        is_entry, score = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0, 0.0)
+        is_entry, score, is_bear = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
         assert isinstance(score, float), "Corrupted data should be processed safely into a float score."
         assert is_entry is False, "Corrupted data should not trigger an entry."
     except Exception as e:
         raise AssertionError(f"Failed to handle corrupted data safely: {e}")
         
     try:
-        AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0, 0.0) # type: ignore
+        AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0) # type: ignore
         assert False, "evaluate_entry should raise TypeError for non-dict input"
     except TypeError:
         pass
@@ -413,7 +406,7 @@ if __name__ == "__main__":
             exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (FINAL DEFENSE)")
+        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (DYNAMIC LIMIT DEPTH)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -423,7 +416,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Final Defense Optimized)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Dynamic Limit Depth)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -437,7 +430,7 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 ディフェンス完成版 分析レポート")
+        print(f" 🔬 動的極深指値ハイブリッド版 分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
         print(f" [3] ハードストップ(絶対防衛線): {st['hard_stops']} 回")
