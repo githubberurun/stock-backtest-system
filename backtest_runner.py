@@ -408,11 +408,13 @@ def run_integrity_tests() -> None:
 if __name__ == "__main__":
     run_integrity_tests()
     try:
-        # ご指定のディレクトリ構成に適応
+        # ランナー環境に応じてデータディレクトリを自動選択するフォールバック処理
         data_dir = "Colog_github"
         if not os.path.exists(data_dir):
-            print(f"[ERROR] Directory '{data_dir}' not found. Please run data_fetcher.py first.")
-            exit(1)
+            data_dir = "data"
+            if not os.path.exists(data_dir):
+                print(f"[ERROR] Directories 'Colog_github' and 'data' not found. Please run data_fetcher.py first.")
+                exit(1)
             
         print("\n==================================================")
         print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (STRESS TEST VER.)")
