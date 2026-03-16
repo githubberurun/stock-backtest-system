@@ -27,12 +27,12 @@ class JQuantsV2Fetcher:
         safe_date = datetime.now() - timedelta(days=365 * 10 - 1)
         return safe_date.strftime("%Y-%m-%d")
 
-    def get_top_tickers(self, limit: int = 300) -> List[str]:
+    def get_top_tickers(self, limit: int = 1000) -> List[str]:
         """直近の売買代金上位銘柄を抽出する"""
         if not isinstance(limit, int) or limit <= 0:
             raise ValueError("limit must be a positive integer")
             
-        print("[INFO] Fetching top tickers by TurnoverValue...")
+        print(f"[INFO] Fetching top {limit} tickers by TurnoverValue...")
         target_date = datetime.now().date()
         
         for _ in range(5):
@@ -44,7 +44,8 @@ class JQuantsV2Fetcher:
                     if len(data) > 500:
                         df = pd.DataFrame(data)
                         df['Va_n'] = pd.to_numeric(df.get('TurnoverValue', df.get('Va', 0)), errors='coerce')
-                        top_df = df[df['Va_n'] >= 50_000_000].sort_values('Va_n', ascending=False).head(limit)
+                        # 売買代金が極端に低いものは除外した上で、指定件数を取得
+                        top_df = df[df['Va_n'] >= 10_000_000].sort_values('Va_n', ascending=False).head(limit)
                         return [str(code)[:4] for code in top_df['Code'].tolist()]
             except Exception as e:
                 print(f"[WARN] Failed to fetch daily data for {target_date}: {e}")
@@ -84,7 +85,8 @@ class JQuantsV2Fetcher:
             pagination_key = res_json.get("pagination_key")
             if not pagination_key:
                 break
-            time.sleep(0.3)
+            # J-Quants APIのレートリミットを考慮しつつ、ギリギリまで待機を短縮
+            time.sleep(0.1)
 
         return self._clean(pd.DataFrame(all_data))
 
@@ -129,6 +131,19 @@ class JQuantsV2Fetcher:
         return df
 
 # ==========================================
+# キャッシュ判定補助関数
+# ==========================================
+def is_recently_updated(filepath: str, hours: int = 12) -> bool:
+    """指定されたファイルが存在し、かつ最終更新日時が指定時間以内ならTrue"""
+    if not os.path.exists(filepath):
+        return False
+    
+    file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+    time_diff = datetime.now() - file_mtime
+    
+    return time_diff < timedelta(hours=hours)
+
+# ==========================================
 # 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def test_integrity() -> None:
@@ -165,19 +180,38 @@ if __name__ == "__main__":
         exit(0)
         
     fetcher = JQuantsV2Fetcher(key)
-    os.makedirs("data", exist_ok=True)
     
-    target_tickers = fetcher.get_top_tickers(limit=300)
+    # 保存先ディレクトリ。プロジェクト名「Colog_github」を優先。
+    data_dir = "Colog_github"
+    if not os.path.exists(data_dir):
+        data_dir = "data"
+    os.makedirs(data_dir, exist_ok=True)
+    
+    # 取得母数を 1000 銘柄に拡張
+    TARGET_LIMIT = 1000
+    target_tickers = fetcher.get_top_tickers(limit=TARGET_LIMIT)
+    
+    # ベンチマーク(TOPIX ETF)は必ず追加
     if "13060" not in target_tickers:
         target_tickers.append("13060")
         
     print(f"[INFO] Starting data fetch for {len(target_tickers)} tickers...")
     
     for i, target_ticker in enumerate(target_tickers):
-        print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ")
+        print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ", flush=True)
+        
+        file_path = f"{data_dir}/{target_ticker}.parquet"
+        
+        # --- キャッシュ判定（12時間以内に取得済みならスキップ） ---
+        if is_recently_updated(file_path, hours=12):
+            print("SKIPPED (Used Cache)")
+            continue
+            
         fetched_data = fetcher.fetch(target_ticker)
         if not fetched_data.empty:
-            fetched_data.to_parquet(f"data/{target_ticker}.parquet", index=False)
+            fetched_data.to_parquet(file_path, index=False)
             print(f"OK ({len(fetched_data)} rows)")
         else:
             print("FAILED")
+            
+    print("[INFO] Data fetching process completed.")
