@@ -152,7 +152,7 @@ class AdvancedStrategyAnalyzer:
         return float(max(1.0, limit_price))
 
 # ==========================================
-# 2. 米国市場キャッシュ & ポートフォリオバックテスター
+# 2. 米国市場データ & ポートフォリオバックテスター
 # ==========================================
 class USMarketCache:
     def __init__(self) -> None:
@@ -168,7 +168,8 @@ class USMarketCache:
                 self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
             else:
                 self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
-        except Exception:
+        except Exception as e:
+            debug_log(f"Failed to fetch US market data: {e}")
             self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
 
     def get_state(self, date_str: str) -> Tuple[float, float]:
@@ -197,19 +198,43 @@ class PortfolioBacktester:
             'gap_down_cancels': 0 
         }
         
-        debug_log("Loading and calculating indicators for all tickers...")
+        # ------------------------------------------
+        # 高速化キャッシュ機構の実装
+        # ------------------------------------------
+        cache_dir = f"{data_dir}_cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        debug_log(f"Using cache directory: {cache_dir}")
+        
         self.timeline: Dict[str, Dict[str, Dict[str, Any]]] = {}
         dates_set = set()
         
         bm_path = f"{data_dir}/13060.parquet"
         bm_df = pd.read_parquet(bm_path) if os.path.exists(bm_path) else None
         
-        files = [f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet"]
+        # 決定論的ソート（読み込み順序による乱数を排除し完全固定化）
+        files = sorted([f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet"])
+        
+        debug_log(f"Loading {len(files)} tickers. Checking cache...")
         
         for file in files:
             ticker = file.replace(".parquet", "")
-            df = pd.read_parquet(f"{data_dir}/{file}")
-            df = AdvancedStrategyAnalyzer.calculate_indicators(df, bm_df)
+            raw_path = f"{data_dir}/{file}"
+            cache_path = f"{cache_dir}/{file}"
+            
+            try:
+                # キャッシュが存在すればそちらを読み込む（指標計算をスキップ）
+                if os.path.exists(cache_path):
+                    df = pd.read_parquet(cache_path)
+                else:
+                    df = pd.read_parquet(raw_path)
+                    df = AdvancedStrategyAnalyzer.calculate_indicators(df, bm_df)
+                    # 次回以降のためにキャッシュ保存
+                    if not df.empty:
+                        df.to_parquet(cache_path)
+            except Exception as e:
+                debug_log(f"Error processing {ticker}: {e}")
+                continue
+                
             if df.empty: continue
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
@@ -235,6 +260,7 @@ class PortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
+            # --- 前日の指値注文の処理 ---
             new_pending = []
             for order in pending_orders:
                 ticker = order['ticker']
@@ -246,10 +272,12 @@ class PortfolioBacktester:
                     
                     self.stats['limit_placed'] += 1
                     
+                    # ギャップダウン回避
                     if open_p < limit_p:
                         self.stats['gap_down_cancels'] += 1
                         continue 
                         
+                    # 約定判定
                     if low_p <= limit_p:
                         exec_price = limit_p * 1.002 
                         
@@ -266,6 +294,7 @@ class PortfolioBacktester:
                             self.stats['limit_exec'] += 1
             pending_orders = new_pending
 
+            # --- 保有ポジションの更新と決済 ---
             closed_tickers = []
             for ticker, pos in positions.items():
                 if ticker not in today_market: continue
@@ -278,7 +307,7 @@ class PortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
-                # 絶対損失キャップ（-15%）とATR(2.0)の二重防衛
+                # 大型株: 絶対損失キャップ（-15%）とATR(2.0)の二重防衛
                 hard_stop_price_atr = pos['entry_p'] - (current_atr * 2.0)
                 hard_stop_price_abs = pos['entry_p'] * 0.85 
                 hard_stop_price = max(hard_stop_price_atr, hard_stop_price_abs)
@@ -287,16 +316,19 @@ class PortfolioBacktester:
                     exit_score += 100
                     self.stats['hard_stops'] += 1
                 
+                # 大型株: 2.5ATRトレイリング
                 trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
                 if curr_c <= trailing_stop_price and exit_score == 0:
                     exit_score += 100
                     self.stats['trailing_stops'] += 1
                 
+                # 大型株: 15日タイムストップ
                 if pos['days_held'] >= 15 and curr_c < (pos['entry_p'] * 1.02) and exit_score == 0: 
                     exit_score += 100
                     self.stats['time_stops'] += 1
                     if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
 
+                # 部分利確ロジック
                 if current_atr > 0 and curr_c > pos['entry_p'] and exit_score < 80:
                     r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
                     if r_mult >= 4.0 and not pos['took_3r']:
@@ -323,6 +355,7 @@ class PortfolioBacktester:
             for ct in closed_tickers:
                 del positions[ct]
 
+            # --- 新規エントリーの評価 ---
             open_slots = self.max_positions - len(positions)
             if open_slots > 0 and cash > 0:
                 candidates = []
@@ -334,26 +367,22 @@ class PortfolioBacktester:
                         limit_p = AdvancedStrategyAnalyzer.calculate_limit_price(row, self.attr, n_chg, is_bear, vix)
                         candidates.append((score, ticker, limit_p))
                 
-                candidates.sort(key=lambda x: x[0], reverse=True)
+                # 【重要】同点の際のティッカー順による確定的ソート（ランダム性排除）
+                candidates.sort(key=lambda x: (-x[0], x[1]))
                 
-                # ==========================================
-                # 【MDD限界突破策】 エントリーの時間分散（Tranche Buying）
-                # ==========================================
-                # パニック相場（VIX>=20）の時は、どんなに候補が多くても「1日最大2銘柄まで」しか注文を出さない。
-                # これにより「1日で資金の100%を底なし沼に突っ込む」リスクを根絶する。
+                # 時間分散（VIX>=20時は1日2銘柄まで）
                 is_high_risk = vix >= 20.0
                 max_daily_new_orders = 2 if is_high_risk else self.max_positions
                 allowed_slots_today = min(open_slots, max_daily_new_orders)
                 
                 for score, ticker, limit_p in candidates[:allowed_slots_today]:
-                    # オープン枠全体でキャッシュを等分（1銘柄あたり最大20%のルールは維持）
                     target_alloc = cash / open_slots 
                     pending_orders.append({
                         'ticker': ticker,
                         'limit_price': limit_p,
                         'allocated_cash': target_alloc
                     })
-                    open_slots -= 1 # 計算上の残り枠を減らす
+                    open_slots -= 1 
 
             daily_equity = cash
             for ticker, pos in positions.items():
@@ -388,7 +417,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests for Time Diversification Logic...")
+    debug_log("Running integrity and edge-case tests...")
     
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
@@ -413,6 +442,7 @@ def run_integrity_tests() -> None:
 if __name__ == "__main__":
     run_integrity_tests()
     try:
+        # ご利用の環境に合わせたディレクトリ設定
         data_dir = "Colog_github"
         if not os.path.exists(data_dir):
             data_dir = "data"
@@ -421,7 +451,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING PORTFOLIO CROSS-SECTIONAL BACKTEST (TIME DIVERSIFICATION VER.)")
+        print(" 🚀 STARTING LARGE-CAP PORTFOLIO BACKTEST (CACHED & DETERMINISTIC)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -431,7 +461,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Time Diversification Optimized)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Deterministic)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -445,7 +475,7 @@ if __name__ == "__main__":
         ts_win_rate = (st['time_stop_wins'] / st['time_stops']) * 100 if st['time_stops'] > 0 else 0
         
         print(f"==================================================")
-        print(f" 🔬 時間分散（打診買い） 分析レポート")
+        print(f" 🔬 詳細分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f"     ┗ 危険な窓開け回避(注文キャンセル): {st['gap_down_cancels']} 回")
         print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
