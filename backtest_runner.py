@@ -182,7 +182,7 @@ class USMarketCache:
         return 0.0, 15.0
 
 class PortfolioBacktester:
-    def __init__(self, data_dir: str, initial_cash: float = 1000000.0, max_positions: int = 5) -> None:
+    def __init__(self, data_dir: str, initial_cash: float = 1000000.0, max_positions: int = 20) -> None:
         if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
         self.cash: float = initial_cash
         self.initial_cash: float = initial_cash
@@ -295,8 +295,9 @@ class PortfolioBacktester:
                 pos['high_p'] = max(pos['high_p'], curr_c)
                 exit_score = 0
                 
+                # 【修正箇所】絶対損失キャップを -15%(0.85) から -12%(0.88) へタイト化
                 hard_stop_price_atr = pos['entry_p'] - (current_atr * 2.0)
-                hard_stop_price_abs = pos['entry_p'] * 0.85 
+                hard_stop_price_abs = pos['entry_p'] * 0.88 
                 hard_stop_price = max(hard_stop_price_atr, hard_stop_price_abs)
                 
                 if curr_c <= hard_stop_price:
@@ -351,12 +352,11 @@ class PortfolioBacktester:
                         vol_ratio = AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 0.0))
                         candidates.append((score, vol_ratio, ticker, limit_p))
                 
-                # 【修正箇所】スコア(降順) -> 出来高急増率(降順) -> ティッカー(昇順) でソート
-                # これによりセクターの偏りを防ぎ、最も反発エネルギーの強い銘柄を優先します
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
                 
+                # 【修正箇所】パニック時の1日あたりの時間分散上限を 2銘柄 から 5銘柄(資金の25%) へ拡張
                 is_high_risk = vix >= 20.0
-                max_daily_new_orders = 2 if is_high_risk else self.max_positions
+                max_daily_new_orders = 5 if is_high_risk else self.max_positions
                 allowed_slots_today = min(open_slots, max_daily_new_orders)
                 
                 for score, vol_ratio, ticker, limit_p in candidates[:allowed_slots_today]:
@@ -434,17 +434,18 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING LARGE-CAP PORTFOLIO BACKTEST (VOL-RATIO SORTED)")
+        print(" 🚀 STARTING LARGE-CAP PORTFOLIO BACKTEST (POSITION SIZING OPTIMIZED)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
-        MAX_CONCURRENT_POSITIONS = 5
+        # 【最重要変更点】保有枠を 5 -> 20 へ拡大
+        MAX_CONCURRENT_POSITIONS = 20
         
         tester = PortfolioBacktester(data_dir=data_dir, initial_cash=STARTING_CAPITAL, max_positions=MAX_CONCURRENT_POSITIONS)
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Volume Ratio Sorted)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (20 Positions Max)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
