@@ -68,6 +68,10 @@ class AdvancedStrategyAnalyzer:
         df['macd'] = df['ema12'] - df['ema26']
         df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
         
+        # 【追加】モメンタム判定用のMACDヒストグラムとその傾き
+        df['macd_hist'] = df['macd'] - df['sig']
+        df['macd_hist_slope'] = df['macd_hist'].diff()
+        
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -111,18 +115,24 @@ class AdvancedStrategyAnalyzer:
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
             return False, 0.0, False
         
+        curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
+        ma75 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma75', 0.0))
         bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
         bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
         rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0), 50.0)
         rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0), 0.0)
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
+        macd_hist_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('macd_hist_slope', 0.0))
         
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
+        
+        # 【追加】中長期トレンドへの逆張りペナルティ（落ちるナイフ回避）
+        trend_penalty = 20.0 if curr_price > 0 and ma75 > 0 and curr_price < ma75 else 0.0
 
         if is_bear_market:
             if rsi_val > 30.0 or vol_ratio < 1.5:
                 return False, 0.0, is_bear_market
-            total_score = 90.0
+            total_score = 90.0 - trend_penalty
         else:
             if rs_21_val < 0.0:
                 return False, 0.0, is_bear_market
@@ -130,7 +140,11 @@ class AdvancedStrategyAnalyzer:
             if vol_ratio >= 1.5: main_score += 20
             if 50 <= rsi_val <= 75: main_score += 15
             elif rsi_val < 40: main_score += 20
-            total_score = main_score + 30.0
+            
+            # 【追加】MACDヒストグラムが上向いているか（モメンタム好転）
+            if macd_hist_slope > 0: main_score += 15
+            
+            total_score = main_score + 30.0 - trend_penalty
             
         is_entry = (total_score >= 80)
         return is_entry, float(total_score), is_bear_market
@@ -245,7 +259,7 @@ class PortfolioBacktester:
         cash = self.cash
         positions: Dict[str, Dict[str, Any]] = {} 
         pending_buy_orders: List[Dict[str, Any]] = [] 
-        pending_sell_orders: List[str] = [] # 翌日始値で売却する銘柄リスト
+        pending_sell_orders: List[str] = []
         equity_curve: List[float] = []
         total_trades = 0
 
@@ -253,9 +267,7 @@ class PortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
-            # --------------------------------------------------
-            # 1. 翌日始値での売却処理 (前日にアラートが出た銘柄)
-            # --------------------------------------------------
+            # 1. 翌日始値での売却処理
             executed_sells = []
             for ticker in pending_sell_orders:
                 if ticker in today_market and ticker in positions:
@@ -263,17 +275,14 @@ class PortfolioBacktester:
                     open_p = AdvancedStrategyAnalyzer._to_float(row.get('open', 0.0))
                     if open_p > 0:
                         pos = positions[ticker]
-                        sell_val = pos['qty'] * (open_p * 0.998) # 手数料・スリッページ考慮
+                        sell_val = pos['qty'] * (open_p * 0.998)
                         cash += sell_val
                         total_trades += 1
                         del positions[ticker]
                         executed_sells.append(ticker)
-            # 売却完了または上場廃止等で処理不可能な銘柄をリストから除外
             pending_sell_orders = [t for t in pending_sell_orders if t not in executed_sells and t in positions]
 
-            # --------------------------------------------------
             # 2. 指値買いの処理
-            # --------------------------------------------------
             for order in pending_buy_orders:
                 ticker = str(order['ticker'])
                 if ticker in today_market and len(positions) < self.max_positions:
@@ -284,12 +293,12 @@ class PortfolioBacktester:
                     
                     self.stats['limit_placed'] += 1
                     
-                    if open_p < limit_p * 0.95: # 著しいギャップダウンは危険回避キャンセル
+                    if open_p < limit_p * 0.95:
                         self.stats['gap_down_cancels'] += 1
                         continue 
                         
                     if low_p <= limit_p:
-                        exec_price = limit_p * 1.002 # スリッページ加算
+                        exec_price = limit_p * 1.002
                         alloc_cash = float(order['allocated_cash'])
                         qty = alloc_cash // exec_price
                         
@@ -301,12 +310,9 @@ class PortfolioBacktester:
                             }
                             self.stats['limit_exec'] += 1
 
-            # 【重要】約定しなかった指値注文はすべてキャンセル（毎日有望銘柄をリフレッシュするため）
             pending_buy_orders = []
 
-            # --------------------------------------------------
-            # 3. 大引けでの売りアラート判定（翌日売却のフラグ立て）
-            # --------------------------------------------------
+            # 3. 大引けでの売りアラート判定
             new_sells_for_tomorrow = []
             for ticker, pos in positions.items():
                 if ticker in today_market and ticker not in pending_sell_orders:
@@ -318,28 +324,28 @@ class PortfolioBacktester:
                     pos['high_p'] = max(pos['high_p'], curr_c)
                     exit_triggered = False
                     
-                    # ハードストップ（-12%タイト化維持）
+                    # ハードストップ（絶対防衛線は維持）
                     hard_stop_price = max(pos['entry_p'] - (current_atr * 2.0), pos['entry_p'] * 0.88)
                     if curr_c <= hard_stop_price:
                         self.stats['hard_stops'] += 1
                         exit_triggered = True
                     
-                    # トレイリングストップ
-                    trailing_stop_price = pos['high_p'] - (current_atr * 2.5)
+                    # 【変更】トレイリングストップの緩和（2.5 -> 3.0 ATR）
+                    trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
                     if curr_c <= trailing_stop_price and not exit_triggered:
                         self.stats['trailing_stops'] += 1
                         exit_triggered = True
                     
-                    # タイムストップ
-                    if pos['days_held'] >= 15 and curr_c < (pos['entry_p'] * 1.02) and not exit_triggered: 
+                    # 【変更】タイムストップの延長（15日 -> 20日、微益ラインを+3%へ）
+                    if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.03) and not exit_triggered: 
                         self.stats['time_stops'] += 1
                         if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
                         exit_triggered = True
 
-                    # 分割利確（利確は当日大引け付近での処理として継続、ただし全決済はしない）
+                    # 【変更】分割利確ラインの引き上げ（3.0R と 5.0R）
                     if current_atr > 0 and curr_c > pos['entry_p'] and not exit_triggered:
                         r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
-                        if r_mult >= 4.0 and not pos['took_3r']:
+                        if r_mult >= 5.0 and not pos['took_3r']:
                             sell_qty = int(pos['qty'] // 2)
                             if sell_qty > 0:
                                 cash += sell_qty * (curr_c * 0.998)
@@ -347,7 +353,7 @@ class PortfolioBacktester:
                                 total_trades += 1
                             pos['took_3r'] = True
                             pos['took_2r'] = True
-                        elif r_mult >= 2.5 and not pos['took_2r']:
+                        elif r_mult >= 3.0 and not pos['took_2r']:
                             sell_qty = int(pos['qty'] // 3)
                             if sell_qty > 0:
                                 cash += sell_qty * (curr_c * 0.998)
@@ -360,16 +366,12 @@ class PortfolioBacktester:
 
             pending_sell_orders.extend(new_sells_for_tomorrow)
 
-            # --------------------------------------------------
             # 4. 有望銘柄の選出と明日の指値設定
-            # --------------------------------------------------
-            # 現在の保有数から空き枠を算出 (売却予定の銘柄は明日には枠が空く想定だが、安全策として真の空き枠のみ利用)
             open_slots = self.max_positions - len(positions)
             
             if open_slots > 0 and cash > 0:
                 candidates = []
                 for ticker, row in today_market.items():
-                    # 既に保有中、あるいは明日売る予定の銘柄には指値を入れない
                     if ticker in positions or ticker in pending_sell_orders: 
                         continue 
                     
@@ -379,15 +381,12 @@ class PortfolioBacktester:
                         vol_ratio = AdvancedStrategyAnalyzer._to_float(row.get('vol_ratio', 0.0))
                         candidates.append((score, vol_ratio, ticker, limit_p))
                 
-                # スコア順にソート (有望な順)
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
                 
-                # パニック時は1日あたりのエントリー数を制限しつつ、最大でもopen_slotsまで
                 is_high_risk = vix >= 20.0
                 max_daily_new_orders = 5 if is_high_risk else self.max_positions
                 allowed_slots_today = min(open_slots, max_daily_new_orders)
                 
-                # 資金効率最適化：残資金を空き枠数で均等割り（1銘柄あたりの投下資金）
                 target_alloc = cash / open_slots if open_slots > 0 else 0
                 
                 for score, vol_ratio, ticker, limit_p in candidates[:allowed_slots_today]:
@@ -397,9 +396,7 @@ class PortfolioBacktester:
                         'allocated_cash': target_alloc
                     })
 
-            # --------------------------------------------------
             # 日次の資産評価
-            # --------------------------------------------------
             daily_equity = cash
             for ticker, pos in positions.items():
                 if ticker in today_market:
@@ -466,18 +463,17 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (DYNAMIC ALLOCATION & NEXT-DAY OPEN SELL)")
+        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (PROFIT MAXIMIZED)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
-        # 【変更箇所】実運用に合わせ、同時保有数を10へ最適化
         MAX_CONCURRENT_POSITIONS = 10
         
         tester = PortfolioBacktester(data_dir=data_dir, initial_cash=STARTING_CAPITAL, max_positions=MAX_CONCURRENT_POSITIONS)
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max 10 Pos, Daily Rotation)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max 10 Pos, Profit Max)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -494,7 +490,7 @@ if __name__ == "__main__":
         print(f" 🔬 詳細分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f"     ┗ 危険な窓開け回避(注文キャンセル): {st['gap_down_cancels']} 回")
-        print(f" [2] タイムストップ(15日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
+        print(f" [2] タイムストップ(20日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
         print(f" [3] ハードストップ(絶対防衛線): {st['hard_stops']} 回")
         print(f" [4] トレイリングストップ発動: {st['trailing_stops']} 回")
         print(f"==================================================", flush=True)
