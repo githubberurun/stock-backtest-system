@@ -44,7 +44,6 @@ class JQuantsV2Fetcher:
                     if len(data) > 500:
                         df = pd.DataFrame(data)
                         df['Va_n'] = pd.to_numeric(df.get('TurnoverValue', df.get('Va', 0)), errors='coerce')
-                        # 売買代金が極端に低いものは除外した上で、指定件数を取得
                         top_df = df[df['Va_n'] >= 10_000_000].sort_values('Va_n', ascending=False).head(limit)
                         return [str(code)[:4] for code in top_df['Code'].tolist()]
             except Exception as e:
@@ -55,17 +54,20 @@ class JQuantsV2Fetcher:
         print("[ERROR] Could not fetch recent market data.")
         return []
 
-    def fetch(self, ticker: str) -> pd.DataFrame:
+    def fetch(self, ticker: str, start_date: Optional[str] = None) -> pd.DataFrame:
         if not isinstance(ticker, str):
             raise TypeError("ticker must be a string")
+        if start_date is not None and not isinstance(start_date, str):
+            raise TypeError("start_date must be a string")
             
         code: str = f"{ticker}0" if len(ticker) == 4 else ticker
-        start_date: str = self.get_safe_start_date()
+        # 指定がなければ10年前から取得
+        actual_start: str = start_date if start_date else self.get_safe_start_date()
         all_data: List[Dict[str, Any]] = []
         pagination_key: Optional[str] = None
 
         while True:
-            params: Dict[str, Any] = {"code": code, "from": start_date}
+            params: Dict[str, Any] = {"code": code, "from": actual_start}
             if pagination_key:
                 params["pagination_key"] = pagination_key
 
@@ -85,7 +87,6 @@ class JQuantsV2Fetcher:
             pagination_key = res_json.get("pagination_key")
             if not pagination_key:
                 break
-            # J-Quants APIのレートリミットを考慮しつつ、ギリギリまで待機を短縮
             time.sleep(0.1)
 
         return self._clean(pd.DataFrame(all_data))
@@ -121,7 +122,6 @@ class JQuantsV2Fetcher:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # 売買代金が存在しない場合は 終値×出来高 で疑似算出（小型株判定のため必須）
         if 'turnover' not in df.columns or df['turnover'].isnull().all():
             df['turnover'] = df['close'] * df['volume']
                 
@@ -129,21 +129,6 @@ class JQuantsV2Fetcher:
             df = df.dropna(subset=['close']).sort_values("date").reset_index(drop=True)
             
         return df
-
-# ==========================================
-# キャッシュ判定補助関数
-# ==========================================
-def is_recently_updated(filepath: str, hours: int = 12) -> bool:
-    """指定されたファイルが存在し、かつ最終更新日時が指定時間以内ならTrue"""
-    if not isinstance(filepath, str):
-        return False
-    if not os.path.exists(filepath):
-        return False
-    
-    file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
-    time_diff = datetime.now() - file_mtime
-    
-    return time_diff < timedelta(hours=hours)
 
 # ==========================================
 # 空データ・異常値に対する堅牢性証明テスト
@@ -170,6 +155,12 @@ def test_integrity() -> None:
         assert False, "fetch() should raise TypeError for non-string input"
     except TypeError:
         pass
+        
+    try:
+        dummy_fetcher.fetch("7203", start_date=123) # type: ignore
+        assert False, "fetch() should raise TypeError for non-string start_date"
+    except TypeError:
+        pass
 
     print("[TEST] All integrity tests passed.")
 
@@ -183,17 +174,13 @@ if __name__ == "__main__":
         
     fetcher = JQuantsV2Fetcher(key)
     
-    # 保存先ディレクトリ。プロジェクト名「Colog_github」を優先。
+    # 保存ディレクトリの固定化
     data_dir = "Colog_github"
-    if not os.path.exists(data_dir):
-        data_dir = "data"
     os.makedirs(data_dir, exist_ok=True)
     
-    # 【変更箇所】取得母数を 600 銘柄に絞り込み
     TARGET_LIMIT = 600
     target_tickers = fetcher.get_top_tickers(limit=TARGET_LIMIT)
     
-    # ベンチマーク(TOPIX ETF)は必ず追加
     if "13060" not in target_tickers:
         target_tickers.append("13060")
         
@@ -203,17 +190,40 @@ if __name__ == "__main__":
         print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ", flush=True)
         
         file_path = f"{data_dir}/{target_ticker}.parquet"
+        existing_df = pd.DataFrame()
+        start_date_for_fetch = None
         
-        # --- キャッシュ判定（12時間以内に取得済みならスキップ） ---
-        if is_recently_updated(file_path, hours=12):
-            print("SKIPPED (Used Cache)")
-            continue
-            
-        fetched_data = fetcher.fetch(target_ticker)
-        if not fetched_data.empty:
-            fetched_data.to_parquet(file_path, index=False)
-            print(f"OK ({len(fetched_data)} rows)")
+        # --- インクリメンタル・アップデート（差分取得） ---
+        if os.path.exists(file_path):
+            existing_df = pd.read_parquet(file_path)
+            if not existing_df.empty and 'date' in existing_df.columns:
+                last_date_obj = pd.to_datetime(existing_df['date'].max())
+                
+                # 最終取得日から今日までの差分日数を計算
+                days_diff = (datetime.now().date() - last_date_obj.date()).days
+                
+                if days_diff <= 0:
+                    print("CACHED (SKIP)")
+                    continue
+                    
+                # 差分のみ取得するため開始日を指定（翌日から）
+                start_date_for_fetch = (last_date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        fetched_data = fetcher.fetch(target_ticker, start_date=start_date_for_fetch)
+        
+        if not existing_df.empty:
+            if not fetched_data.empty:
+                # 既存データと新規データを結合し、重複を排除
+                combined = pd.concat([existing_df, fetched_data]).drop_duplicates(subset=['date']).sort_values('date').reset_index(drop=True)
+                combined.to_parquet(file_path, index=False)
+                print(f"UPDATED (Appended {len(fetched_data)} rows)")
+            else:
+                print("CACHED (Up to date)")
         else:
-            print("FAILED")
-            
+            if not fetched_data.empty:
+                fetched_data.to_parquet(file_path, index=False)
+                print(f"OK ({len(fetched_data)} rows)")
+            else:
+                print("FAILED")
+                
     print("[INFO] Data fetching process completed.")
