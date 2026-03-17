@@ -27,7 +27,7 @@ class JQuantsV2Fetcher:
         safe_date = datetime.now() - timedelta(days=365 * 10 - 1)
         return safe_date.strftime("%Y-%m-%d")
 
-    def get_top_tickers(self, limit: int = 1000) -> List[str]:
+    def get_top_tickers(self, limit: int = 600) -> List[str]:
         """直近の売買代金上位銘柄を抽出する"""
         if not isinstance(limit, int) or limit <= 0:
             raise ValueError("limit must be a positive integer")
@@ -135,6 +135,8 @@ class JQuantsV2Fetcher:
 # ==========================================
 def is_recently_updated(filepath: str, hours: int = 12) -> bool:
     """指定されたファイルが存在し、かつ最終更新日時が指定時間以内ならTrue"""
+    if not isinstance(filepath, str):
+        return False
     if not os.path.exists(filepath):
         return False
     
@@ -187,8 +189,8 @@ if __name__ == "__main__":
         data_dir = "data"
     os.makedirs(data_dir, exist_ok=True)
     
-    # 取得母数を 1000 銘柄に拡張
-    TARGET_LIMIT = 1000
+    # 【変更箇所】取得母数を 600 銘柄に絞り込み
+    TARGET_LIMIT = 600
     target_tickers = fetcher.get_top_tickers(limit=TARGET_LIMIT)
     
     # ベンチマーク(TOPIX ETF)は必ず追加
