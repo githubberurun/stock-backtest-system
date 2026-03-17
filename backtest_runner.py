@@ -106,7 +106,8 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        if n_chg <= -2.5 or vix >= 33.0:
+        # 【MDD対策1】VIXフィルターの厳格化 (33.0 -> 28.0 で強制ストップ)
+        if n_chg <= -2.5 or vix >= 28.0:
             return False, 0.0, False
             
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
@@ -226,7 +227,6 @@ class PortfolioBacktester:
             cache_path = f"{cache_dir}/{file}"
             
             try:
-                # --- 生データの更新日時とキャッシュの更新日時を比較し、自動再構築を担保 ---
                 raw_mtime = os.path.getmtime(raw_path)
                 if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= raw_mtime:
                     df = pd.read_parquet(cache_path)
@@ -319,7 +319,8 @@ class PortfolioBacktester:
                     pos['high_p'] = max(pos['high_p'], curr_c)
                     exit_triggered = False
                     
-                    hard_stop_price = max(pos['entry_p'] - (current_atr * 2.0), pos['entry_p'] * 0.88)
+                    # 【MDD対策2】ハードストップのタイト化 (-12% or 2.0ATR -> -10% or 1.5ATR)
+                    hard_stop_price = max(pos['entry_p'] - (current_atr * 1.5), pos['entry_p'] * 0.90)
                     if curr_c <= hard_stop_price:
                         self.stats['hard_stops'] += 1
                         exit_triggered = True
@@ -374,7 +375,8 @@ class PortfolioBacktester:
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
                 
                 is_high_risk = vix >= 20.0
-                max_daily_new_orders = 5 if is_high_risk else self.max_positions
+                # 【MDD対策3】パニック相場時の買い枠制限の強化 (最大5 -> 最大3)
+                max_daily_new_orders = 3 if is_high_risk else self.max_positions
                 allowed_slots_today = min(open_slots, max_daily_new_orders)
                 
                 target_alloc = cash / open_slots if open_slots > 0 else 0
@@ -452,7 +454,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (PROFIT MAXIMIZED)")
+        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (MDD CONTROLLED)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -462,7 +464,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max 10 Pos, Profit Max)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max 10 Pos, MDD Focused)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
