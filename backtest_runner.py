@@ -68,7 +68,6 @@ class AdvancedStrategyAnalyzer:
         df['macd'] = df['ema12'] - df['ema26']
         df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
         
-        # 【追加】モメンタム判定用のMACDヒストグラムとその傾き
         df['macd_hist'] = df['macd'] - df['sig']
         df['macd_hist_slope'] = df['macd_hist'].diff()
         
@@ -125,8 +124,6 @@ class AdvancedStrategyAnalyzer:
         macd_hist_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('macd_hist_slope', 0.0))
         
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
-        
-        # 【追加】中長期トレンドへの逆張りペナルティ（落ちるナイフ回避）
         trend_penalty = 20.0 if curr_price > 0 and ma75 > 0 and curr_price < ma75 else 0.0
 
         if is_bear_market:
@@ -141,7 +138,6 @@ class AdvancedStrategyAnalyzer:
             if 50 <= rsi_val <= 75: main_score += 15
             elif rsi_val < 40: main_score += 20
             
-            # 【追加】MACDヒストグラムが上向いているか（モメンタム好転）
             if macd_hist_slope > 0: main_score += 15
             
             total_score = main_score + 30.0 - trend_penalty
@@ -230,7 +226,9 @@ class PortfolioBacktester:
             cache_path = f"{cache_dir}/{file}"
             
             try:
-                if os.path.exists(cache_path):
+                # --- 生データの更新日時とキャッシュの更新日時を比較し、自動再構築を担保 ---
+                raw_mtime = os.path.getmtime(raw_path)
+                if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= raw_mtime:
                     df = pd.read_parquet(cache_path)
                 else:
                     df = pd.read_parquet(raw_path)
@@ -267,7 +265,6 @@ class PortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
-            # 1. 翌日始値での売却処理
             executed_sells = []
             for ticker in pending_sell_orders:
                 if ticker in today_market and ticker in positions:
@@ -282,7 +279,6 @@ class PortfolioBacktester:
                         executed_sells.append(ticker)
             pending_sell_orders = [t for t in pending_sell_orders if t not in executed_sells and t in positions]
 
-            # 2. 指値買いの処理
             for order in pending_buy_orders:
                 ticker = str(order['ticker'])
                 if ticker in today_market and len(positions) < self.max_positions:
@@ -312,7 +308,6 @@ class PortfolioBacktester:
 
             pending_buy_orders = []
 
-            # 3. 大引けでの売りアラート判定
             new_sells_for_tomorrow = []
             for ticker, pos in positions.items():
                 if ticker in today_market and ticker not in pending_sell_orders:
@@ -324,25 +319,21 @@ class PortfolioBacktester:
                     pos['high_p'] = max(pos['high_p'], curr_c)
                     exit_triggered = False
                     
-                    # ハードストップ（絶対防衛線は維持）
                     hard_stop_price = max(pos['entry_p'] - (current_atr * 2.0), pos['entry_p'] * 0.88)
                     if curr_c <= hard_stop_price:
                         self.stats['hard_stops'] += 1
                         exit_triggered = True
                     
-                    # 【変更】トレイリングストップの緩和（2.5 -> 3.0 ATR）
                     trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
                     if curr_c <= trailing_stop_price and not exit_triggered:
                         self.stats['trailing_stops'] += 1
                         exit_triggered = True
                     
-                    # 【変更】タイムストップの延長（15日 -> 20日、微益ラインを+3%へ）
                     if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.03) and not exit_triggered: 
                         self.stats['time_stops'] += 1
                         if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
                         exit_triggered = True
 
-                    # 【変更】分割利確ラインの引き上げ（3.0R と 5.0R）
                     if current_atr > 0 and curr_c > pos['entry_p'] and not exit_triggered:
                         r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
                         if r_mult >= 5.0 and not pos['took_3r']:
@@ -366,7 +357,6 @@ class PortfolioBacktester:
 
             pending_sell_orders.extend(new_sells_for_tomorrow)
 
-            # 4. 有望銘柄の選出と明日の指値設定
             open_slots = self.max_positions - len(positions)
             
             if open_slots > 0 and cash > 0:
@@ -396,7 +386,6 @@ class PortfolioBacktester:
                         'allocated_cash': target_alloc
                     })
 
-            # 日次の資産評価
             daily_equity = cash
             for ticker, pos in positions.items():
                 if ticker in today_market:
