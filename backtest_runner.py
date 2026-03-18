@@ -115,7 +115,6 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 【完全復元】最高益(927%)を叩き出したアグレッシブなエントリー条件
         if n_chg <= -2.5 or vix >= 33.0:
             return False, 0.0, False
             
@@ -160,8 +159,9 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # 【完全復元】元の指値距離（深い指値すぎると約定しなかったため）
-        if is_bear_market or vix >= 20.0:
+        if vix >= 30.0:
+            base_offset = 2.0
+        elif is_bear_market or vix >= 20.0:
             base_offset = 1.2
         else:
             base_offset = 0.1
@@ -178,11 +178,12 @@ class USMarketCache:
         debug_log("Initializing US market data cache...")
         self.cache_file = os.path.join(data_dir, "us_market_cache.parquet")
         
-        # 【修正】yfinanceデータの完全キャッシュ化（API無駄打ち排除）
         if is_recently_updated(self.cache_file, hours=12):
             debug_log("Loading US market data from local cache (SKIPPED download)...")
             try:
                 df = pd.read_parquet(self.cache_file)
+                # 【バグ修正】キャッシュ内にある重複インデックスを削除
+                df = df[~df.index.duplicated(keep='last')]
                 self.ndx = df['ndx']
                 self.vix = df['vix']
                 return
@@ -198,6 +199,9 @@ class USMarketCache:
                 vix_series = vix_data['Close']
                 df = pd.DataFrame({'ndx': ndx_series, 'vix': vix_series})
                 df.index = df.index.tz_localize(None).strftime('%Y-%m-%d')
+                
+                # 【バグ修正】yfinanceから稀に返る重複日付（Series化の原因）を強制排除
+                df = df[~df.index.duplicated(keep='last')]
                 df.to_parquet(self.cache_file)
                 self.ndx = df['ndx']
                 self.vix = df['vix']
@@ -214,7 +218,12 @@ class USMarketCache:
         for i in range(1, 6):
             prev = (dt - timedelta(days=i)).strftime('%Y-%m-%d')
             if prev in self.ndx.index and prev in self.vix.index: 
-                return float(self.ndx[prev]), float(self.vix[prev])
+                # 【バグ修正】万が一の重複対策として、Seriesが返った場合は末尾の値を抽出
+                n_val = self.ndx[prev]
+                v_val = self.vix[prev]
+                if isinstance(n_val, pd.Series): n_val = n_val.iloc[-1]
+                if isinstance(v_val, pd.Series): v_val = v_val.iloc[-1]
+                return float(n_val), float(v_val)
         return 0.0, 15.0
 
 class PortfolioBacktester:
@@ -231,7 +240,7 @@ class PortfolioBacktester:
             'time_stops': 0, 'time_stop_wins': 0,
             'hard_stops': 0, 'trailing_stops': 0,
             'gap_down_cancels': 0,
-            'circuit_breaker_hits': 0  # 【新規】サーキットブレーカー発動回数
+            'circuit_breaker_hits': 0  
         }
         
         cache_dir = f"{data_dir}_cache"
@@ -244,7 +253,11 @@ class PortfolioBacktester:
         bm_path = f"{data_dir}/13060.parquet"
         bm_df = pd.read_parquet(bm_path) if os.path.exists(bm_path) else None
         
-        files = sorted([f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet"])
+        # 【バグ修正】`us_market_cache.parquet` 等の意図しないファイルをリストから明示的に除外
+        files = sorted([f for f in os.listdir(data_dir) 
+                        if f.endswith(".parquet") 
+                        and f not in ["13060.parquet", "us_market_cache.parquet"]])
+                        
         debug_log(f"Loading {len(files)} tickers. Checking cache...")
         
         for file in files:
@@ -287,7 +300,6 @@ class PortfolioBacktester:
         equity_curve: List[float] = []
         total_trades = 0
         
-        # 【新規】ポートフォリオ・サーキットブレーカーの管理変数
         circuit_breaker_active = False
         circuit_breaker_cooldown = 0
         current_max_equity = self.initial_cash
@@ -296,7 +308,6 @@ class PortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
-            # クーリングオフ期間の消化
             if circuit_breaker_cooldown > 0:
                 circuit_breaker_cooldown -= 1
                 if circuit_breaker_cooldown == 0:
@@ -356,7 +367,6 @@ class PortfolioBacktester:
                     pos['high_p'] = max(pos['high_p'], curr_c)
                     exit_triggered = False
                     
-                    # 【完全復元】927%を出したゆとりあるイグジット（無駄な損切り排除）
                     hard_stop_price = max(pos['entry_p'] - (current_atr * 2.0), pos['entry_p'] * 0.88)
                     if curr_c <= hard_stop_price:
                         self.stats['hard_stops'] += 1
@@ -395,7 +405,6 @@ class PortfolioBacktester:
 
             pending_sell_orders.extend(new_sells_for_tomorrow)
 
-            # --- ポートフォリオ資産の計算とサーキットブレーカー判定 ---
             daily_equity = cash
             for ticker, pos in positions.items():
                 if ticker in today_market:
@@ -403,11 +412,9 @@ class PortfolioBacktester:
                     daily_equity += pos['qty'] * (curr_c * 0.998)
             equity_curve.append(daily_equity)
             
-            # 最高資産の更新とドローダウンの監視
             current_max_equity = max(current_max_equity, daily_equity)
             current_dd = (daily_equity - current_max_equity) / current_max_equity if current_max_equity > 0 else 0
             
-            # 【新規】資産がピークから -25% 沈んだら、強制的に新規買いを10日間停止
             if current_dd <= -0.25 and not circuit_breaker_active:
                 self.stats['circuit_breaker_hits'] += 1
                 circuit_breaker_active = True
@@ -415,7 +422,6 @@ class PortfolioBacktester:
 
             open_slots = self.max_positions - len(positions)
             
-            # CB発動中は新規指値の抽出をスキップ
             if not circuit_breaker_active and open_slots > 0 and cash > 0:
                 candidates = []
                 for ticker, row in today_market.items():
@@ -430,7 +436,6 @@ class PortfolioBacktester:
                 
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
                 
-                # 【完全復元】買い枠の復活
                 is_high_risk = vix >= 20.0
                 max_daily_new_orders = 5 if is_high_risk else self.max_positions
                 allowed_slots_today = min(open_slots, max_daily_new_orders)
