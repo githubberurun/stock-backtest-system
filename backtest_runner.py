@@ -103,8 +103,7 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 【900%超エンジン完全復元】
-        if n_chg <= -2.5 or vix >= 33.0:
+        if n_chg <= -2.5 or vix >= 35.0:
             return False, 0.0, False
             
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
@@ -124,21 +123,18 @@ class AdvancedStrategyAnalyzer:
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
         trend_penalty = 20.0 if curr_price > 0 and ma75 > 0 and curr_price < ma75 else 0.0
         
-        # 【最強銘柄ピックアップ】TOPIXより強い(RS値が高い)銘柄にボーナススコアを付与
-        rs_bonus = min(20.0, max(0.0, rs_21_val / 2.0))
-
+        # 利益極大化: 下落相場での強烈な買い向かい条件
         if is_bear_market:
-            if rsi_val > 30.0 or vol_ratio < 1.5: return False, 0.0, is_bear_market
-            total_score = 90.0 - trend_penalty + rs_bonus
+            if rsi_val > 30.0 or vol_ratio < 1.0: return False, 0.0, is_bear_market
+            total_score = 100.0 - trend_penalty
         else:
             if rs_21_val < 0.0: return False, 0.0, is_bear_market
             main_score = 30.0
             if vol_ratio >= 1.5: main_score += 20
-            if 50 <= rsi_val <= 75: main_score += 15
-            elif rsi_val < 40: main_score += 20
+            if rsi_val < 45: main_score += 35
             
             if macd_hist_slope > 0: main_score += 15
-            total_score = main_score + 30.0 - trend_penalty + rs_bonus
+            total_score = main_score + 20.0 - trend_penalty
             
         is_entry = (total_score >= 80)
         return is_entry, float(total_score), is_bear_market
@@ -149,10 +145,11 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        if is_bear_market or vix >= 20.0:
-            base_offset = 1.2
+        # 利益極大化: 暴落時は指値を極限まで深掘りし、落ちるナイフの柄を掴む
+        if is_bear_market or vix >= 25.0:
+            base_offset = 1.5 
         else:
-            base_offset = 0.1
+            base_offset = 0.2
             
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -1.0 else 0.0
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
@@ -222,7 +219,7 @@ class PortfolioBacktester:
         
         self.stats: Dict[str, int] = {
             'limit_placed': 0, 'limit_exec': 0, 'time_stops': 0, 'time_stop_wins': 0,
-            'hard_stops': 0, 'trailing_stops': 0, 'profit_protect_stops': 0, 'gap_down_cancels': 0
+            'hard_stops': 0, 'trailing_stops': 0, 'gap_down_cancels': 0
         }
         
         cache_dir = f"{data_dir}_cache"
@@ -339,29 +336,19 @@ class PortfolioBacktester:
                     pos['high_p'] = max(pos['high_p'], curr_c)
                     exit_triggered = False
                     
-                    hard_stop_price = max(pos['entry_p'] - (current_atr * 2.0), pos['entry_p'] * 0.88)
-                    trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
-
-                    # ==========================================================
-                    # 【新搭載: Profit Protect (勝ち逃げ・ブレイクイーブンストップ)】
-                    # 含み益が+2ATRを超えたら、ストップロスを買値の+1%へ強制引き上げ
-                    # ==========================================================
-                    is_profit_protected = False
-                    if current_atr > 0 and pos['high_p'] >= pos['entry_p'] + (current_atr * 2.0):
-                        breakeven_plus = pos['entry_p'] * 1.01
-                        if trailing_stop_price < breakeven_plus:
-                            trailing_stop_price = breakeven_plus
-                            is_profit_protected = True
+                    # 損切り貧乏を完全に防ぐための呼吸空間の拡大
+                    # 極端なノイズに耐えるため -3.0ATR まで許容
+                    hard_stop_price = pos['entry_p'] - (current_atr * 3.0) 
+                    
+                    # 利益を極限まで伸ばすため、トレイリングも -4.0ATR へ拡大
+                    trailing_stop_price = pos['high_p'] - (current_atr * 4.0)
                     
                     if curr_c <= hard_stop_price:
                         self.stats['hard_stops'] += 1
                         exit_triggered = True
                     
                     if curr_c <= trailing_stop_price and not exit_triggered:
-                        if is_profit_protected and curr_c >= pos['entry_p']:
-                            self.stats['profit_protect_stops'] += 1
-                        else:
-                            self.stats['trailing_stops'] += 1
+                        self.stats['trailing_stops'] += 1
                         exit_triggered = True
                     
                     if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.03) and not exit_triggered: 
@@ -408,11 +395,8 @@ class PortfolioBacktester:
                 
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
                 
-                is_high_risk = vix >= 20.0
-                max_daily_new_orders = 5 if is_high_risk else self.max_positions
-                allowed_slots_today = min(open_slots, max_daily_new_orders)
-                
-                # 【927%エンジン復活】資金制限なしで複利をフル回転させる
+                # 暴落時こそフルベットし、複利パワーを爆発させる
+                allowed_slots_today = min(open_slots, self.max_positions)
                 target_alloc = cash / open_slots if open_slots > 0 else 0
                 
                 for score, vol_ratio, ticker, limit_p in candidates[:allowed_slots_today]:
@@ -479,7 +463,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (PROFIT 900+ & PROFIT PROTECT)")
+        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (FULL POWER 900+ ENGINE)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -489,7 +473,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Pure Profit + MDD Protect)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Full Power Restored)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -509,7 +493,6 @@ if __name__ == "__main__":
         print(f" [2] タイムストップ(20日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
         print(f" [3] ハードストップ(絶対防衛線): {st['hard_stops']} 回")
         print(f" [4] トレイリングストップ発動: {st['trailing_stops']} 回")
-        print(f" [5] プロフィット・プロテクト(勝ち逃げ): {st['profit_protect_stops']} 回")
         print(f"==================================================", flush=True)
         
     except Exception as e:
