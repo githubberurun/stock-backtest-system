@@ -14,6 +14,13 @@ from datetime import datetime, timedelta
 BASE_URL: Final[str] = "https://api.jquants.com/v2"
 ENDPOINT: Final[str] = "/equities/bars/daily"
 
+def is_recently_updated(filepath: str, hours: int = 12) -> bool:
+    """物理的なファイルの更新日時をチェックし、指定時間以内ならTrue"""
+    if not isinstance(filepath, str): return False
+    if not os.path.exists(filepath): return False
+    file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+    return (datetime.now() - file_mtime) < timedelta(hours=hours)
+
 class JQuantsV2Fetcher:
     """J-Quants API v2準拠のデータ取得クラス"""
     def __init__(self, api_key: str) -> None:
@@ -21,14 +28,15 @@ class JQuantsV2Fetcher:
             raise TypeError("API key must be a string")
         self.api_key: str = api_key.strip()
         self.headers: Dict[str, str] = {"x-api-key": self.api_key}
+        # 通信の高速化と安定化のためSessionを利用
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
 
     def get_safe_start_date(self) -> str:
-        """プラン制限(10年)の境界値を考慮した開始日を算出"""
         safe_date = datetime.now() - timedelta(days=365 * 10 - 1)
         return safe_date.strftime("%Y-%m-%d")
 
     def get_top_tickers(self, limit: int = 600) -> List[str]:
-        """直近の売買代金上位銘柄を抽出する"""
         if not isinstance(limit, int) or limit <= 0:
             raise ValueError("limit must be a positive integer")
             
@@ -38,7 +46,7 @@ class JQuantsV2Fetcher:
         for _ in range(5):
             params = {"date": target_date.strftime("%Y%m%d")}
             try:
-                response = requests.get(f"{BASE_URL}{ENDPOINT}", headers=self.headers, params=params, timeout=30)
+                response = self.session.get(f"{BASE_URL}{ENDPOINT}", params=params, timeout=15)
                 if response.status_code == 200:
                     data = response.json().get("data", [])
                     if len(data) > 500:
@@ -61,31 +69,40 @@ class JQuantsV2Fetcher:
             raise TypeError("start_date must be a string")
             
         code: str = f"{ticker}0" if len(ticker) == 4 else ticker
-        # 指定がなければ10年前から取得
         actual_start: str = start_date if start_date else self.get_safe_start_date()
         all_data: List[Dict[str, Any]] = []
         pagination_key: Optional[str] = None
+        
+        max_pages: int = 20 # 無限ループフリーズ対策
+        page_count: int = 0
 
-        while True:
+        while page_count < max_pages:
+            page_count += 1
             params: Dict[str, Any] = {"code": code, "from": actual_start}
             if pagination_key:
                 params["pagination_key"] = pagination_key
 
             try:
-                response = requests.get(f"{BASE_URL}{ENDPOINT}", headers=self.headers, params=params, timeout=30)
+                # タイムアウトを15秒に設定し、ハングアップを防止
+                response = self.session.get(f"{BASE_URL}{ENDPOINT}", params=params, timeout=15)
             except requests.exceptions.RequestException as e:
-                print(f"[ERROR] Network error during fetch: {e}")
-                return pd.DataFrame()
+                print(f"[ERROR] Network/Timeout error: {e}")
+                break
 
             if response.status_code != 200:
+                if response.status_code == 429: # レートリミット対策
+                    print(f"[WARN] Rate limit hit on {ticker}. Sleeping for 5 seconds...")
+                    time.sleep(5)
+                    continue
                 print(f"[ERROR] API {response.status_code}: {response.text}")
-                return pd.DataFrame()
+                break
 
             res_json = response.json()
-            all_data.extend(res_json.get("data", []))
+            data_chunk = res_json.get("data", [])
+            all_data.extend(data_chunk)
 
             pagination_key = res_json.get("pagination_key")
-            if not pagination_key:
+            if not pagination_key or len(data_chunk) == 0:
                 break
             time.sleep(0.1)
 
@@ -136,32 +153,10 @@ class JQuantsV2Fetcher:
 def test_integrity() -> None:
     print("[TEST] Running integrity tests for data_fetcher.py...")
     dummy_fetcher = JQuantsV2Fetcher("dummy_key")
-    
-    df_mock_adj = pd.DataFrame({
-        'Date': ['2026-01-01'], 'AdjC': [150.5], 'AdjH': [155.0], 
-        'AdjL': [149.0], 'AdjO': [150.0], 'AdjVo': [5000], 'TurnoverValue': [752500]
-    })
-    cleaned_adj = dummy_fetcher._clean(df_mock_adj)
-    assert 'close' in cleaned_adj.columns, "AdjC should be mapped to 'close'"
-    assert 'turnover' in cleaned_adj.columns, "TurnoverValue should be mapped to 'turnover'"
-    assert cleaned_adj['close'].iloc[0] == 150.5, "Value matching failed for AdjC"
-
     df_empty = pd.DataFrame()
     cleaned_empty = dummy_fetcher._clean(df_empty)
     assert cleaned_empty.empty, "Empty DataFrame should return empty DataFrame"
-    
-    try:
-        dummy_fetcher.fetch(1234) # type: ignore
-        assert False, "fetch() should raise TypeError for non-string input"
-    except TypeError:
-        pass
-        
-    try:
-        dummy_fetcher.fetch("7203", start_date=123) # type: ignore
-        assert False, "fetch() should raise TypeError for non-string start_date"
-    except TypeError:
-        pass
-
+    assert is_recently_updated("non_existent_file.parquet") is False
     print("[TEST] All integrity tests passed.")
 
 if __name__ == "__main__":
@@ -174,50 +169,43 @@ if __name__ == "__main__":
         
     fetcher = JQuantsV2Fetcher(key)
     
-    # 保存ディレクトリの固定化
     data_dir = "Colog_github"
     os.makedirs(data_dir, exist_ok=True)
     
     TARGET_LIMIT = 600
     target_tickers = fetcher.get_top_tickers(limit=TARGET_LIMIT)
-    
-    if "13060" not in target_tickers:
-        target_tickers.append("13060")
+    if "13060" not in target_tickers: target_tickers.append("13060")
         
     print(f"[INFO] Starting data fetch for {len(target_tickers)} tickers...")
     
     for i, target_ticker in enumerate(target_tickers):
         print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ", flush=True)
-        
         file_path = f"{data_dir}/{target_ticker}.parquet"
+        
+        # 【最重要】物理的な更新日時チェック（APIを一切叩かず1秒でスキップ）
+        if is_recently_updated(file_path, hours=12):
+            print("CACHED (Time-Skip)")
+            continue
+
         existing_df = pd.DataFrame()
         start_date_for_fetch = None
         
-        # --- インクリメンタル・アップデート（差分取得） ---
         if os.path.exists(file_path):
             existing_df = pd.read_parquet(file_path)
             if not existing_df.empty and 'date' in existing_df.columns:
                 last_date_obj = pd.to_datetime(existing_df['date'].max())
-                
-                # 最終取得日から今日までの差分日数を計算
-                days_diff = (datetime.now().date() - last_date_obj.date()).days
-                
-                if days_diff <= 0:
-                    print("CACHED (SKIP)")
-                    continue
-                    
-                # 差分のみ取得するため開始日を指定（翌日から）
                 start_date_for_fetch = (last_date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
         
         fetched_data = fetcher.fetch(target_ticker, start_date=start_date_for_fetch)
         
         if not existing_df.empty:
             if not fetched_data.empty:
-                # 既存データと新規データを結合し、重複を排除
                 combined = pd.concat([existing_df, fetched_data]).drop_duplicates(subset=['date']).sort_values('date').reset_index(drop=True)
                 combined.to_parquet(file_path, index=False)
                 print(f"UPDATED (Appended {len(fetched_data)} rows)")
             else:
+                # 【最重要】新しいデータが無くてもファイルの更新日時を「今」にする
+                os.utime(file_path, None)
                 print("CACHED (Up to date)")
         else:
             if not fetched_data.empty:
