@@ -106,25 +106,35 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 【MDD対策1】VIXフィルターの厳格化 (33.0 -> 28.0 で強制ストップ)
+        curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
+        bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
+        bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
+        
+        is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
+
+        # 【追加】市場全体がベア相場かつVIX高騰時は「休むも相場」（完全撤退）
+        if is_bear_market and vix >= 25.0:
+            return False, 0.0, True
+
         if n_chg <= -2.5 or vix >= 28.0:
             return False, 0.0, False
             
+        # 【追加】個別銘柄の長期トレンドフィルター（200日線未満は「落ちるナイフ」として完全排除）
+        ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma200', 0.0))
+        if curr_price > 0 and ma200 > 0 and curr_price < ma200:
+            return False, 0.0, is_bear_market
+
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
             return False, 0.0, False
         
-        curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         ma75 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma75', 0.0))
-        bm_close = AdvancedStrategyAnalyzer._to_float(row_dict.get('close_bm', 0.0))
-        bm_ma200 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bm_ma200', 0.0))
         rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0), 50.0)
         rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0), 0.0)
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
         macd_hist_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('macd_hist_slope', 0.0))
         
-        is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
         trend_penalty = 20.0 if curr_price > 0 and ma75 > 0 and curr_price < ma75 else 0.0
 
         if is_bear_market:
@@ -319,8 +329,8 @@ class PortfolioBacktester:
                     pos['high_p'] = max(pos['high_p'], curr_c)
                     exit_triggered = False
                     
-                    # 【MDD対策2】ハードストップのタイト化 (-12% or 2.0ATR -> -10% or 1.5ATR)
-                    hard_stop_price = max(pos['entry_p'] - (current_atr * 1.5), pos['entry_p'] * 0.90)
+                    # 【変更】ハードストップを適正値へ戻し、ノイズでの無駄な損切りを防ぐ
+                    hard_stop_price = max(pos['entry_p'] - (current_atr * 2.0), pos['entry_p'] * 0.85)
                     if curr_c <= hard_stop_price:
                         self.stats['hard_stops'] += 1
                         exit_triggered = True
@@ -375,7 +385,6 @@ class PortfolioBacktester:
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
                 
                 is_high_risk = vix >= 20.0
-                # 【MDD対策3】パニック相場時の買い枠制限の強化 (最大5 -> 最大3)
                 max_daily_new_orders = 3 if is_high_risk else self.max_positions
                 allowed_slots_today = min(open_slots, max_daily_new_orders)
                 
@@ -454,7 +463,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (MDD CONTROLLED)")
+        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (MDD CONTROLLED 2.0)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -464,7 +473,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max 10 Pos, MDD Focused)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max 10 Pos, MDD Focused 2.0)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
