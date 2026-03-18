@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 import yfinance as yf
+import gc
 from typing import Dict, List, Any, Optional, Tuple, Set
 from datetime import datetime, timedelta
 
@@ -18,8 +19,11 @@ def debug_log(msg: str) -> None:
 def is_recently_updated(filepath: str, hours: int = 12) -> bool:
     if not isinstance(filepath, str): return False
     if not os.path.exists(filepath): return False
-    file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
-    return (datetime.now() - file_mtime) < timedelta(hours=hours)
+    try:
+        file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+        return (datetime.now() - file_mtime) < timedelta(hours=hours)
+    except Exception:
+        return False
 
 # ==========================================
 # 1. 大型株専用・統合分析エンジン
@@ -266,6 +270,7 @@ class PortfolioBacktester:
                 
         self.sorted_dates = sorted(list(dates_set))
         debug_log(f"Timeline built. Total trading days: {len(self.sorted_dates)}")
+        gc.collect() # 初期ロード後のメモリ解放
 
     def run(self) -> Dict[str, Any]:
         cash = self.cash
@@ -393,9 +398,8 @@ class PortfolioBacktester:
                 allowed_slots_today = min(open_slots, max_daily_new_orders)
                 
                 # ==============================================================
-                # 【新搭載: ポジションサイズMDD制御】
-                # サーキットブレーカーで取引を全停止するのではなく、
-                # VIXが高いパニック時のみ、1銘柄あたりの投資資金(ロット)を半減させる
+                # 【ポジションサイズMDD制御】
+                # 取引を止めず、VIXが高いパニック時のみ投資資金(ロット)を半減させる
                 # ==============================================================
                 alloc_ratio = 1.0
                 if vix >= 25.0:
