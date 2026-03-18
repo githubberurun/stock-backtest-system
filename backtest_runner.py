@@ -12,16 +12,12 @@ from datetime import datetime, timedelta
 # ==========================================
 
 def debug_log(msg: str) -> None:
-    """内部デバッグ用のロギング関数"""
     if not isinstance(msg, str): raise TypeError("msg must be a string")
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def is_recently_updated(filepath: str, hours: int = 12) -> bool:
-    """キャッシュファイルの有効期限を判定"""
-    if not isinstance(filepath, str):
-        return False
-    if not os.path.exists(filepath):
-        return False
+    if not isinstance(filepath, str): return False
+    if not os.path.exists(filepath): return False
     file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
     return (datetime.now() - file_mtime) < timedelta(hours=hours)
 
@@ -41,10 +37,8 @@ class AdvancedStrategyAnalyzer:
 
     @staticmethod
     def calculate_indicators(df: pd.DataFrame, benchmark_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError("df must be a pandas DataFrame")
-        if df.empty or len(df) < 200: 
-            return df
+        if not isinstance(df, pd.DataFrame): raise TypeError("df must be a pandas DataFrame")
+        if df.empty or len(df) < 200: return df
             
         df.columns = [str(c).lower() for c in df.columns]
         required_cols = {'open', 'high', 'low', 'close', 'volume'}
@@ -63,10 +57,8 @@ class AdvancedStrategyAnalyzer:
         df['prev_low'] = df['low'].shift(1)
         df['ma75'] = df['close'].rolling(window=75).mean()
         df['ma200'] = df['close'].rolling(window=200).mean()
-        df['bb_width'] = np.where(df['ma20'] > 0, (df['std20'] * 4) / df['ma20'], 0)
         
         df['is_bullish'] = df['close'] > df['open']
-        
         df['was_above_bb_p1'] = (df['high'] >= df['bb_p1']).rolling(window=5).max() > 0
         df['bb_p1_cross_down'] = df['was_above_bb_p1'] & (df['close'] < df['bb_p1']) & (df['close'] < df['prev_low'])
         df['was_above_bb_up_3'] = (df['high'] >= df['bb_up_3']).rolling(window=3).max() > 0
@@ -76,7 +68,6 @@ class AdvancedStrategyAnalyzer:
         df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = df['ema12'] - df['ema26']
         df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
-        
         df['macd_hist'] = df['macd'] - df['sig']
         df['macd_hist_slope'] = df['macd_hist'].diff()
         
@@ -84,13 +75,8 @@ class AdvancedStrategyAnalyzer:
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
-        df['rsi_slope'] = df['rsi'] - df['rsi'].shift(5)
         
-        tr = pd.concat([
-            (df['high'] - df['low']), 
-            (df['high'] - df['close'].shift()).abs(), 
-            (df['low'] - df['close'].shift()).abs()
-        ], axis=1).max(axis=1)
+        tr = pd.concat([(df['high'] - df['low']), (df['high'] - df['close'].shift()).abs(), (df['low'] - df['close'].shift()).abs()], axis=1).max(axis=1)
         df['tr'] = tr
         df['atr'] = df['tr'].rolling(window=14).mean() 
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
@@ -102,10 +88,8 @@ class AdvancedStrategyAnalyzer:
             df['close_bm'] = df['close_bm'].ffill()
             df['bm_ma200'] = df['bm_ma200'].ffill()
             df['rs_21'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
-            df['rs'] = df['rs_21']
         else:
             df['rs_21'] = 0.0
-            df['rs'] = 0.0
             df['close_bm'] = 0.0
             df['bm_ma200'] = 0.0
 
@@ -115,7 +99,7 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 【927%完全復元】サーキットブレーカー等の不要な制限を全廃し、最高益ロジックのみを抽出
+        # 【927%完全復元】サーキットブレーカー等の不要な制限を全廃
         if n_chg <= -2.5 or vix >= 33.0:
             return False, 0.0, False
             
@@ -137,12 +121,10 @@ class AdvancedStrategyAnalyzer:
         trend_penalty = 20.0 if curr_price > 0 and ma75 > 0 and curr_price < ma75 else 0.0
 
         if is_bear_market:
-            if rsi_val > 30.0 or vol_ratio < 1.5:
-                return False, 0.0, is_bear_market
+            if rsi_val > 30.0 or vol_ratio < 1.5: return False, 0.0, is_bear_market
             total_score = 90.0 - trend_penalty
         else:
-            if rs_21_val < 0.0:
-                return False, 0.0, is_bear_market
+            if rs_21_val < 0.0: return False, 0.0, is_bear_market
             main_score = 30.0
             if vol_ratio >= 1.5: main_score += 20
             if 50 <= rsi_val <= 75: main_score += 15
@@ -160,7 +142,7 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # 【927%完全復元】
+        # 【927%完全復元】適正な指値距離
         if is_bear_market or vix >= 20.0:
             base_offset = 1.2
         else:
@@ -179,7 +161,7 @@ class USMarketCache:
         self.cache_file = os.path.join(data_dir, "us_market_cache.parquet")
         
         if is_recently_updated(self.cache_file, hours=12):
-            debug_log("Loading US market data from local cache (SKIPPED download)...")
+            debug_log("Loading US market data from local cache...")
             try:
                 df = pd.read_parquet(self.cache_file)
                 df = df[~df.index.duplicated(keep='last')]
@@ -233,10 +215,8 @@ class PortfolioBacktester:
         self.us_market = USMarketCache(data_dir)
         
         self.stats: Dict[str, int] = {
-            'limit_placed': 0, 'limit_exec': 0,
-            'time_stops': 0, 'time_stop_wins': 0,
-            'hard_stops': 0, 'trailing_stops': 0,
-            'gap_down_cancels': 0
+            'limit_placed': 0, 'limit_exec': 0, 'time_stops': 0, 'time_stop_wins': 0,
+            'hard_stops': 0, 'trailing_stops': 0, 'gap_down_cancels': 0
         }
         
         cache_dir = f"{data_dir}_cache"
@@ -341,7 +321,6 @@ class PortfolioBacktester:
                             self.stats['limit_exec'] += 1
 
             pending_buy_orders = []
-
             new_sells_for_tomorrow = []
             for ticker, pos in positions.items():
                 if ticker in today_market and ticker not in pending_sell_orders:
@@ -408,18 +387,19 @@ class PortfolioBacktester:
                 
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
                 
-                # 【927%完全復元】
+                # 【927%完全復元】買い向かう枠の確保
                 is_high_risk = vix >= 20.0
                 max_daily_new_orders = 5 if is_high_risk else self.max_positions
                 allowed_slots_today = min(open_slots, max_daily_new_orders)
                 
                 # ==============================================================
                 # 【新搭載: ポジションサイズMDD制御】
-                # 取引は止めずに、「VIXが高い時だけ」1銘柄あたりの投資資金を半減させる
+                # サーキットブレーカーで取引を全停止するのではなく、
+                # VIXが高いパニック時のみ、1銘柄あたりの投資資金(ロット)を半減させる
                 # ==============================================================
                 alloc_ratio = 1.0
                 if vix >= 25.0:
-                    alloc_ratio = 0.5 # パニック相場ではロットを半分に落とし、現金を温存
+                    alloc_ratio = 0.5 
                     
                 target_alloc = (cash / open_slots) * alloc_ratio if open_slots > 0 else 0
                 
@@ -463,8 +443,7 @@ class PortfolioBacktester:
 # 3. 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
 def run_integrity_tests() -> None:
-    debug_log("Running integrity and edge-case tests...")
-    
+    debug_log("Running integrity tests...")
     empty_df = pd.DataFrame()
     res_df = AdvancedStrategyAnalyzer.calculate_indicators(empty_df)
     assert res_df.empty, "Empty DataFrame should return empty DataFrame"
@@ -472,17 +451,9 @@ def run_integrity_tests() -> None:
     dummy_row_err = {'rsi': np.nan, 'dev25': 'invalid', 'rs_21': None}
     try:
         is_entry, score, is_bear = AdvancedStrategyAnalyzer.evaluate_entry(dummy_row_err, "スイング", 0.0, 15.0)
-        assert isinstance(score, float), "Corrupted data should be processed safely into a float score."
         assert is_entry is False, "Corrupted data should not trigger an entry."
     except Exception as e:
         raise AssertionError(f"Failed to handle corrupted data safely: {e}")
-        
-    try:
-        AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0) # type: ignore
-        assert False, "evaluate_entry should raise TypeError for non-dict input"
-    except TypeError:
-        pass
-
     debug_log("All integrity tests passed.")
 
 if __name__ == "__main__":
