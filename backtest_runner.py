@@ -16,6 +16,15 @@ def debug_log(msg: str) -> None:
     if not isinstance(msg, str): raise TypeError("msg must be a string")
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
+def is_recently_updated(filepath: str, hours: int = 12) -> bool:
+    """キャッシュファイルの有効期限を判定"""
+    if not isinstance(filepath, str):
+        return False
+    if not os.path.exists(filepath):
+        return False
+    file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+    return (datetime.now() - file_mtime) < timedelta(hours=hours)
+
 # ==========================================
 # 1. 大型株専用・統合分析エンジン
 # ==========================================
@@ -106,7 +115,7 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 【復元】最強ロジックの緩やかなVIX制限（33.0）に戻し、暴落時の利益を狙う
+        # 【完全復元】最高益(927%)を叩き出したアグレッシブなエントリー条件
         if n_chg <= -2.5 or vix >= 33.0:
             return False, 0.0, False
             
@@ -125,8 +134,6 @@ class AdvancedStrategyAnalyzer:
         macd_hist_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('macd_hist_slope', 0.0))
         
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
-        
-        # 【復元】完全撤退ではなく、ペナルティ加算で強い銘柄は拾う
         trend_penalty = 20.0 if curr_price > 0 and ma75 > 0 and curr_price < ma75 else 0.0
 
         if is_bear_market:
@@ -142,7 +149,6 @@ class AdvancedStrategyAnalyzer:
             elif rsi_val < 40: main_score += 20
             
             if macd_hist_slope > 0: main_score += 15
-            
             total_score = main_score + 30.0 - trend_penalty
             
         is_entry = (total_score >= 80)
@@ -154,10 +160,8 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # 【追加】ディープ・リミット: 極端なパニック時は指値をさらに深くして安全マージンを劇的向上
-        if vix >= 30.0:
-            base_offset = 2.0
-        elif is_bear_market or vix >= 20.0:
+        # 【完全復元】元の指値距離（深い指値すぎると約定しなかったため）
+        if is_bear_market or vix >= 20.0:
             base_offset = 1.2
         else:
             base_offset = 0.1
@@ -167,20 +171,36 @@ class AdvancedStrategyAnalyzer:
         return float(max(1.0, limit_price))
 
 # ==========================================
-# 2. 米国市場データ & ポートフォリオバックテスター
+# 2. 米国市場データキャッシュ & ポートフォリオバックテスター
 # ==========================================
 class USMarketCache:
-    def __init__(self) -> None:
-        debug_log("Caching US market data...")
+    def __init__(self, data_dir: str) -> None:
+        debug_log("Initializing US market data cache...")
+        self.cache_file = os.path.join(data_dir, "us_market_cache.parquet")
+        
+        # 【修正】yfinanceデータの完全キャッシュ化（API無駄打ち排除）
+        if is_recently_updated(self.cache_file, hours=12):
+            debug_log("Loading US market data from local cache (SKIPPED download)...")
+            try:
+                df = pd.read_parquet(self.cache_file)
+                self.ndx = df['ndx']
+                self.vix = df['vix']
+                return
+            except Exception as e:
+                debug_log(f"Cache read failed: {e}. Falling back to download.")
+                
+        debug_log("Fetching US market data from yfinance...")
         try:
             ndx_data = yf.Ticker("^IXIC").history(period="10y")
             vix_data = yf.Ticker("^VIX").history(period="10y")
             if not ndx_data.empty and not vix_data.empty:
-                self.ndx = ndx_data['Close'].pct_change() * 100
-                self.vix = vix_data['Close']
-                
-                self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
-                self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
+                ndx_series = ndx_data['Close'].pct_change() * 100
+                vix_series = vix_data['Close']
+                df = pd.DataFrame({'ndx': ndx_series, 'vix': vix_series})
+                df.index = df.index.tz_localize(None).strftime('%Y-%m-%d')
+                df.to_parquet(self.cache_file)
+                self.ndx = df['ndx']
+                self.vix = df['vix']
             else:
                 self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
         except Exception as e:
@@ -204,13 +224,14 @@ class PortfolioBacktester:
         self.initial_cash: float = initial_cash
         self.max_positions: int = max_positions
         self.attr: str = "スイング" 
-        self.us_market = USMarketCache()
+        self.us_market = USMarketCache(data_dir)
         
         self.stats: Dict[str, int] = {
             'limit_placed': 0, 'limit_exec': 0,
             'time_stops': 0, 'time_stop_wins': 0,
             'hard_stops': 0, 'trailing_stops': 0,
-            'gap_down_cancels': 0 
+            'gap_down_cancels': 0,
+            'circuit_breaker_hits': 0  # 【新規】サーキットブレーカー発動回数
         }
         
         cache_dir = f"{data_dir}_cache"
@@ -265,11 +286,22 @@ class PortfolioBacktester:
         pending_sell_orders: List[str] = []
         equity_curve: List[float] = []
         total_trades = 0
+        
+        # 【新規】ポートフォリオ・サーキットブレーカーの管理変数
+        circuit_breaker_active = False
+        circuit_breaker_cooldown = 0
+        current_max_equity = self.initial_cash
 
         for date_str in self.sorted_dates:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
+            # クーリングオフ期間の消化
+            if circuit_breaker_cooldown > 0:
+                circuit_breaker_cooldown -= 1
+                if circuit_breaker_cooldown == 0:
+                    circuit_breaker_active = False
+
             executed_sells = []
             for ticker in pending_sell_orders:
                 if ticker in today_market and ticker in positions:
@@ -324,28 +356,17 @@ class PortfolioBacktester:
                     pos['high_p'] = max(pos['high_p'], curr_c)
                     exit_triggered = False
                     
-                    # 【復元】ハードストップはゆとりを持たせ、ノイズでの無駄な損切りを回避する
+                    # 【完全復元】927%を出したゆとりあるイグジット（無駄な損切り排除）
                     hard_stop_price = max(pos['entry_p'] - (current_atr * 2.0), pos['entry_p'] * 0.88)
                     if curr_c <= hard_stop_price:
                         self.stats['hard_stops'] += 1
                         exit_triggered = True
                     
-                    # 【追加】スマート・トレイリングストップ (環境で利幅を可変)
-                    bm_ma200_val = AdvancedStrategyAnalyzer._to_float(row.get('bm_ma200', 0.0))
-                    bm_close_val = AdvancedStrategyAnalyzer._to_float(row.get('close_bm', 0.0))
-                    is_bm_bear = bm_close_val > 0 and bm_ma200_val > 0 and bm_close_val < bm_ma200_val
-                    
-                    ts_atr_mult = 2.5 if is_bm_bear else 3.5
-                    trailing_stop_price = pos['high_p'] - (current_atr * ts_atr_mult)
+                    trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
                     if curr_c <= trailing_stop_price and not exit_triggered:
                         self.stats['trailing_stops'] += 1
                         exit_triggered = True
                     
-                    # 【追加】出血の早期止血 (8日経っても買値より0.5ATR以上沈んでいる場合は見切る)
-                    if pos['days_held'] >= 8 and curr_c < (pos['entry_p'] - current_atr * 0.5) and not exit_triggered:
-                        self.stats['time_stops'] += 1
-                        exit_triggered = True
-
                     if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.03) and not exit_triggered: 
                         self.stats['time_stops'] += 1
                         if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
@@ -374,9 +395,28 @@ class PortfolioBacktester:
 
             pending_sell_orders.extend(new_sells_for_tomorrow)
 
+            # --- ポートフォリオ資産の計算とサーキットブレーカー判定 ---
+            daily_equity = cash
+            for ticker, pos in positions.items():
+                if ticker in today_market:
+                    curr_c = AdvancedStrategyAnalyzer._to_float(today_market[ticker].get('close', pos['entry_p']))
+                    daily_equity += pos['qty'] * (curr_c * 0.998)
+            equity_curve.append(daily_equity)
+            
+            # 最高資産の更新とドローダウンの監視
+            current_max_equity = max(current_max_equity, daily_equity)
+            current_dd = (daily_equity - current_max_equity) / current_max_equity if current_max_equity > 0 else 0
+            
+            # 【新規】資産がピークから -25% 沈んだら、強制的に新規買いを10日間停止
+            if current_dd <= -0.25 and not circuit_breaker_active:
+                self.stats['circuit_breaker_hits'] += 1
+                circuit_breaker_active = True
+                circuit_breaker_cooldown = 10 
+
             open_slots = self.max_positions - len(positions)
             
-            if open_slots > 0 and cash > 0:
+            # CB発動中は新規指値の抽出をスキップ
+            if not circuit_breaker_active and open_slots > 0 and cash > 0:
                 candidates = []
                 for ticker, row in today_market.items():
                     if ticker in positions or ticker in pending_sell_orders: 
@@ -390,15 +430,11 @@ class PortfolioBacktester:
                 
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
                 
-                # 【復元】最大オーダー数を戻し、リバウンドをしっかり捉える
-                if vix >= 30.0:
-                    max_daily_new_orders = 2
-                elif vix >= 20.0:
-                    max_daily_new_orders = 5
-                else:
-                    max_daily_new_orders = self.max_positions
-                
+                # 【完全復元】買い枠の復活
+                is_high_risk = vix >= 20.0
+                max_daily_new_orders = 5 if is_high_risk else self.max_positions
                 allowed_slots_today = min(open_slots, max_daily_new_orders)
+                
                 target_alloc = cash / open_slots if open_slots > 0 else 0
                 
                 for score, vol_ratio, ticker, limit_p in candidates[:allowed_slots_today]:
@@ -407,13 +443,6 @@ class PortfolioBacktester:
                         'limit_price': limit_p,
                         'allocated_cash': target_alloc
                     })
-
-            daily_equity = cash
-            for ticker, pos in positions.items():
-                if ticker in today_market:
-                    curr_c = AdvancedStrategyAnalyzer._to_float(today_market[ticker].get('close', pos['entry_p']))
-                    daily_equity += pos['qty'] * (curr_c * 0.998)
-            equity_curve.append(daily_equity)
 
         final_equity = equity_curve[-1] if equity_curve else self.initial_cash
         
@@ -474,7 +503,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (PROFIT MAX + SMART DEFENSE)")
+        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (PROFIT MAX + PORTFOLIO CB)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -484,7 +513,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Smart Defense)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Smart Defense V2)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -501,9 +530,10 @@ if __name__ == "__main__":
         print(f" 🔬 詳細分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
         print(f"     ┗ 危険な窓開け回避(注文キャンセル): {st['gap_down_cancels']} 回")
-        print(f" [2] 早期/時間撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
+        print(f" [2] 時間切れ撤退(20日): {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
         print(f" [3] ハードストップ(絶対防衛線): {st['hard_stops']} 回")
         print(f" [4] トレイリングストップ発動: {st['trailing_stops']} 回")
+        print(f" [5] サーキットブレーカー発動: {st['circuit_breaker_hits']} 回 (MDD軽減用)")
         print(f"==================================================", flush=True)
         
     except Exception as e:
