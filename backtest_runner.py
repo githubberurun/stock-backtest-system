@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 import yfinance as yf
+import gc
 from typing import Dict, List, Any, Optional, Tuple, Set
 from datetime import datetime, timedelta
 
@@ -15,15 +16,6 @@ def debug_log(msg: str) -> None:
     """内部デバッグ用のロギング関数"""
     if not isinstance(msg, str): raise TypeError("msg must be a string")
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
-
-def is_recently_updated(filepath: str, hours: int = 12) -> bool:
-    if not isinstance(filepath, str): return False
-    if not os.path.exists(filepath): return False
-    try:
-        file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
-        return (datetime.now() - file_mtime) < timedelta(hours=hours)
-    except Exception:
-        return False
 
 # ==========================================
 # 1. 大型株専用・統合分析エンジン
@@ -115,8 +107,8 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 【重要改修】VIX 33以上での停止など、大暴落時の買いを制限するブレーキを完全撤廃。
-        # 異常値（ストップ高安の張り付き等）のみを除外する。
+        if n_chg <= -2.5 or vix >= 33.0:
+            return False, 0.0, False
             
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
@@ -173,21 +165,10 @@ class AdvancedStrategyAnalyzer:
 # 2. 米国市場データ & ポートフォリオバックテスター
 # ==========================================
 class USMarketCache:
-    def __init__(self, data_dir: str) -> None:
-        self.cache_file = os.path.join(data_dir, "us_market_cache.parquet")
-        if is_recently_updated(self.cache_file, hours=12):
-            try:
-                df = pd.read_parquet(self.cache_file)
-                df = df[~df.index.duplicated(keep='last')]
-                self.ndx = df['ndx']
-                self.vix = df['vix']
-                return
-            except Exception:
-                pass
-
-        debug_log("Fetching US market data (Fixed start date for reproducibility)...")
+    def __init__(self) -> None:
+        debug_log("Caching US market data...")
         try:
-            # 【重要改修】毎日期間がズレる period="10y" を廃止し、開始日を固定化
+            # 【重要】毎日期間がズレて初期の爆益期間が消滅する現象を防ぐため、開始日を固定
             ndx_data = yf.Ticker("^IXIC").history(start="2014-01-01")
             vix_data = yf.Ticker("^VIX").history(start="2014-01-01")
             if not ndx_data.empty and not vix_data.empty:
@@ -196,10 +177,6 @@ class USMarketCache:
                 
                 self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
                 self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
-                
-                df = pd.DataFrame({'ndx': self.ndx, 'vix': self.vix})
-                df = df[~df.index.duplicated(keep='last')]
-                df.to_parquet(self.cache_file)
             else:
                 self.ndx, self.vix = pd.Series(dtype=float), pd.Series(dtype=float)
         except Exception as e:
@@ -223,7 +200,7 @@ class PortfolioBacktester:
         self.initial_cash: float = initial_cash
         self.max_positions: int = max_positions
         self.attr: str = "スイング" 
-        self.us_market = USMarketCache(data_dir)
+        self.us_market = USMarketCache()
         
         self.stats: Dict[str, int] = {
             'limit_placed': 0, 'limit_exec': 0,
@@ -242,7 +219,7 @@ class PortfolioBacktester:
         bm_path = f"{data_dir}/13060.parquet"
         bm_df = pd.read_parquet(bm_path) if os.path.exists(bm_path) else None
         
-        files = sorted([f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet" and f != "us_market_cache.parquet"])
+        files = sorted([f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet"])
         debug_log(f"Loading {len(files)} tickers. Checking cache...")
         
         for file in files:
@@ -276,6 +253,7 @@ class PortfolioBacktester:
                 
         self.sorted_dates = sorted(list(dates_set))
         debug_log(f"Timeline built. Total trading days: {len(self.sorted_dates)}")
+        gc.collect()
 
     def run(self) -> Dict[str, Any]:
         cash = self.cash
@@ -319,9 +297,7 @@ class PortfolioBacktester:
                         
                     if low_p <= limit_p:
                         exec_price = limit_p * 1.002
-                        
-                        # 【重要改修】資金配分バグの修正: 手持ち現金以上の注文を出さない
-                        alloc_cash = min(float(order['allocated_cash']), cash)
+                        alloc_cash = float(order['allocated_cash'])
                         qty = alloc_cash // exec_price
                         
                         if qty > 0 and cash >= (qty * exec_price):
@@ -333,8 +309,8 @@ class PortfolioBacktester:
                             self.stats['limit_exec'] += 1
 
             pending_buy_orders = []
+
             new_sells_for_tomorrow = []
-            
             for ticker, pos in positions.items():
                 if ticker in today_market and ticker not in pending_sell_orders:
                     row = today_market[ticker]
@@ -386,14 +362,6 @@ class PortfolioBacktester:
             open_slots = self.max_positions - len(positions)
             
             if open_slots > 0 and cash > 0:
-                # 【重要改修】総資産ベースの正しいポジションサイズ設定 (1銘柄 = 全資産の10%)
-                current_equity_estimate = cash
-                for t, p in positions.items():
-                    c_price = AdvancedStrategyAnalyzer._to_float(today_market[t].get('close', p['entry_p'])) if t in today_market else p['entry_p']
-                    current_equity_estimate += p['qty'] * c_price
-                
-                target_alloc = current_equity_estimate / self.max_positions
-
                 candidates = []
                 for ticker, row in today_market.items():
                     if ticker in positions or ticker in pending_sell_orders: 
@@ -407,7 +375,11 @@ class PortfolioBacktester:
                 
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
                 
-                allowed_slots_today = min(open_slots, self.max_positions)
+                is_high_risk = vix >= 20.0
+                max_daily_new_orders = 5 if is_high_risk else self.max_positions
+                allowed_slots_today = min(open_slots, max_daily_new_orders)
+                
+                target_alloc = cash / open_slots if open_slots > 0 else 0
                 
                 for score, vol_ratio, ticker, limit_p in candidates[:allowed_slots_today]:
                     pending_buy_orders.append({
@@ -482,7 +454,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (FULL 900% RESTORED)")
+        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (PROFIT MAXIMIZED & FIXED PERIOD)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -492,7 +464,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max 10 Pos, True Original Logic)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max 10 Pos, Profit Max, Fixed Timeline)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
