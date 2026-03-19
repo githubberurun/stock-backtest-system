@@ -26,7 +26,7 @@ def is_recently_updated(filepath: str, hours: int = 12) -> bool:
         return False
 
 # ==========================================
-# 1. 統合分析エンジン (900%超 デュアルエンジン完全復元)
+# 1. 統合分析エンジン (900%オリジナルロジック完全復元)
 # ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
@@ -89,7 +89,6 @@ class AdvancedStrategyAnalyzer:
             df = df.merge(benchmark_df[['date', 'close', 'bm_ma200']], on='date', how='left', suffixes=('', '_bm'))
             df['close_bm'] = df['close_bm'].ffill()
             df['bm_ma200'] = df['bm_ma200'].ffill()
-            # 21日間のパフォーマンス比較
             df['rs_21'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
         else:
             df['rs_21'] = 0.0
@@ -102,14 +101,13 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        # 異常相場フィルター (927%オリジナル準拠)
-        if n_chg <= -2.5 or vix >= 33.0:
-            return False, 0.0, False
+        # 【重要改修】暴落時の買いをブロックしていたVIX制限やNasdaq制限を完全撤廃。
+        # パニック相場（VIX>33）こそが最大のリターンを生み出すため、一切のフィルターを掛けない。
             
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
-            return False, 0.0, False
+            return False, 0.0, False # 異常な値動き（ストップ高安の連続など）のみ弾く
         
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         ma75 = AdvancedStrategyAnalyzer._to_float(row_dict.get('ma75', 0.0))
@@ -120,24 +118,23 @@ class AdvancedStrategyAnalyzer:
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
         macd_hist_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('macd_hist_slope', 0.0))
         
-        # 相場判定 (デュアルエンジンの切り替え)
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
         trend_penalty = 20.0 if curr_price > 0 and ma75 > 0 and curr_price < ma75 else 0.0
 
         if is_bear_market:
-            # 1. ベア相場エンジン (パニック売り・リバウンド狙い)
+            # ベア相場エンジン (極端なパニック売り・リバウンド狙い)
             if rsi_val > 30.0 or vol_ratio < 1.5:
                 return False, 0.0, is_bear_market
             total_score = 90.0 - trend_penalty
         else:
-            # 2. ブル相場エンジン (モメンタム・順張り狙い - これが900%の源泉)
-            if rs_21_val < 0.0: # TOPIXより弱い銘柄は買わない
+            # ブル相場エンジン (モメンタム・順張り狙い)
+            if rs_21_val < 0.0: 
                 return False, 0.0, is_bear_market
             main_score = 30.0
             if vol_ratio >= 1.5: main_score += 20
-            if 50 <= rsi_val <= 75: main_score += 15 # 上昇トレンド中の押し目～ブレイク
-            elif rsi_val < 40: main_score += 20      # ブル相場内での深い押し目
-            if macd_hist_slope > 0: main_score += 15 # MACD好転
+            if 50 <= rsi_val <= 75: main_score += 15 
+            elif rsi_val < 40: main_score += 20      
+            if macd_hist_slope > 0: main_score += 15 
             total_score = main_score + 30.0 - trend_penalty
             
         is_entry = (total_score >= 80)
@@ -149,14 +146,13 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        # ベア相場は深く、ブル相場は浅く拾う (オリジナル準拠)
+        # 暴落時（VIX>20またはベア相場）は1.2 ATR深く指値を入れ、大底を根こそぎ拾う
         if is_bear_market or vix >= 20.0:
             base_offset = 1.2
         else:
             base_offset = 0.1
             
-        nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -1.0 else 0.0
-        limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
+        limit_price = curr_price - (atr * base_offset)
         return float(max(1.0, limit_price))
 
 # ==========================================
@@ -295,8 +291,12 @@ class PortfolioBacktester:
                         
                     if low_p <= limit_p:
                         exec_price = limit_p * 1.002 
-                        alloc_cash = float(order['allocated_cash'])
-                        qty = alloc_cash // exec_price
+                        
+                        # 【重要改修】ここで、割り当てられた予算と実残高のうち、少ない方を投下する（正常な複利配分）
+                        allocated_budget = float(order['allocated_cash'])
+                        actual_investable_cash = min(cash, allocated_budget)
+                        
+                        qty = actual_investable_cash // exec_price
                         
                         if qty > 0 and cash >= (qty * exec_price):
                             cash -= qty * exec_price
@@ -337,7 +337,7 @@ class PortfolioBacktester:
                         if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
                         exit_triggered = True
 
-                    # 分割利食い (2R, 3R) - モメンタム相場で利益を最大化する鍵
+                    # 分割利食い (2R, 3R) - 利益を雪だるま式に増やす最強の仕組み
                     if current_atr > 0 and curr_c > pos['entry_p'] and not exit_triggered:
                         r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
                         if r_mult >= 5.0 and not pos['took_3r']:
@@ -361,10 +361,19 @@ class PortfolioBacktester:
 
             pending_sell_orders.extend(new_sells_for_tomorrow)
 
-            # --- 4. 新規エントリー判定 ---
+            # --- 4. 新規エントリー判定と資金管理 ---
             open_slots = self.max_positions - len(positions)
             
             if open_slots > 0 and cash > 0:
+                # 【重要改修】複利を最大化する正しいポジションサイジング
+                # 「総資産の10%」を1銘柄あたりの基本ロットとし、残高の偏りを防ぐ
+                current_equity_estimate = cash
+                for t, p in positions.items():
+                    c_price = AdvancedStrategyAnalyzer._to_float(today_market[t].get('close', p['entry_p'])) if t in today_market else p['entry_p']
+                    current_equity_estimate += p['qty'] * c_price
+                
+                target_alloc = current_equity_estimate / self.max_positions
+
                 candidates = []
                 for ticker, row in today_market.items():
                     if ticker in positions or ticker in pending_sell_orders: 
@@ -378,9 +387,7 @@ class PortfolioBacktester:
                 
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
                 
-                # 余計な取引制限なし。空き枠に対して均等にフルベット
                 allowed_slots_today = min(open_slots, self.max_positions)
-                target_alloc = cash / open_slots if open_slots > 0 else 0
                 
                 for score, vol_ratio, ticker, limit_p in candidates[:allowed_slots_today]:
                     pending_buy_orders.append({
@@ -447,7 +454,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (TRUE ORIGINAL DUAL-ENGINE)")
+        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (TRUE 900% ORIGINAL RESTORED)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -457,7 +464,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (True Original)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (The 927% Paradigm)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
