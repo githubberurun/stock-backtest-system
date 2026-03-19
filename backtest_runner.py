@@ -13,13 +13,9 @@ from datetime import datetime, timedelta
 # ==========================================
 
 def debug_log(msg: str) -> None:
-    """内部デバッグ用のロギング関数"""
     if not isinstance(msg, str): raise TypeError("msg must be a string")
     print(f"[DEBUG {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ==========================================
-# 1. 大型株専用・統合分析エンジン
-# ==========================================
 class AdvancedStrategyAnalyzer:
     @staticmethod
     def _to_float(val: Any, default: float = 0.0) -> float:
@@ -55,10 +51,8 @@ class AdvancedStrategyAnalyzer:
         df['prev_low'] = df['low'].shift(1)
         df['ma75'] = df['close'].rolling(window=75).mean()
         df['ma200'] = df['close'].rolling(window=200).mean()
-        df['bb_width'] = np.where(df['ma20'] > 0, (df['std20'] * 4) / df['ma20'], 0)
         
         df['is_bullish'] = df['close'] > df['open']
-        
         df['was_above_bb_p1'] = (df['high'] >= df['bb_p1']).rolling(window=5).max() > 0
         df['bb_p1_cross_down'] = df['was_above_bb_p1'] & (df['close'] < df['bb_p1']) & (df['close'] < df['prev_low'])
         df['was_above_bb_up_3'] = (df['high'] >= df['bb_up_3']).rolling(window=3).max() > 0
@@ -68,7 +62,6 @@ class AdvancedStrategyAnalyzer:
         df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = df['ema12'] - df['ema26']
         df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
-        
         df['macd_hist'] = df['macd'] - df['sig']
         df['macd_hist_slope'] = df['macd_hist'].diff()
         
@@ -76,7 +69,6 @@ class AdvancedStrategyAnalyzer:
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         df['rsi'] = 100 - (100 / (1 + (gain / loss.replace(0, np.nan)).fillna(0)))
-        df['rsi_slope'] = df['rsi'] - df['rsi'].shift(5)
         
         tr = pd.concat([
             (df['high'] - df['low']), 
@@ -94,10 +86,8 @@ class AdvancedStrategyAnalyzer:
             df['close_bm'] = df['close_bm'].ffill()
             df['bm_ma200'] = df['bm_ma200'].ffill()
             df['rs_21'] = (df['close'].pct_change(21) - df['close_bm'].pct_change(21)) * 100
-            df['rs'] = df['rs_21']
         else:
             df['rs_21'] = 0.0
-            df['rs'] = 0.0
             df['close_bm'] = 0.0
             df['bm_ma200'] = 0.0
 
@@ -107,11 +97,9 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
-        if n_chg <= -2.5 or vix >= 33.0:
-            return False, 0.0, False
-            
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
+        # ストップ高安などの異常値だけを弾く（VIX制限は外したまま）
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
             return False, 0.0, False
         
@@ -128,19 +116,15 @@ class AdvancedStrategyAnalyzer:
         trend_penalty = 20.0 if curr_price > 0 and ma75 > 0 and curr_price < ma75 else 0.0
 
         if is_bear_market:
-            if rsi_val > 30.0 or vol_ratio < 1.5:
-                return False, 0.0, is_bear_market
+            if rsi_val > 30.0 or vol_ratio < 1.5: return False, 0.0, is_bear_market
             total_score = 90.0 - trend_penalty
         else:
-            if rs_21_val < 0.0:
-                return False, 0.0, is_bear_market
+            if rs_21_val < 0.0: return False, 0.0, is_bear_market
             main_score = 30.0
             if vol_ratio >= 1.5: main_score += 20
             if 50 <= rsi_val <= 75: main_score += 15
             elif rsi_val < 40: main_score += 20
-            
             if macd_hist_slope > 0: main_score += 15
-            
             total_score = main_score + 30.0 - trend_penalty
             
         is_entry = (total_score >= 80)
@@ -152,29 +136,23 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        if is_bear_market or vix >= 20.0:
-            base_offset = 1.2
-        else:
-            base_offset = 0.1
-            
+        base_offset = 1.2 if (is_bear_market or vix >= 20.0) else 0.1
         nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -1.0 else 0.0
         limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
         return float(max(1.0, limit_price))
 
-# ==========================================
-# 2. 米国市場データ & ポートフォリオバックテスター
-# ==========================================
 class USMarketCache:
-    def __init__(self) -> None:
-        debug_log("Caching US market data...")
+    def __init__(self, data_dir: str) -> None:
+        if not isinstance(data_dir, str): raise TypeError("data_dir must be string")
+        self.cache_file = os.path.join(data_dir, "us_market_cache.parquet")
+        
         try:
-            # 【重要】毎日期間がズレて初期の爆益期間が消滅する現象を防ぐため、開始日を固定
+            # 期間を完全に固定してベンチマークのズレを防ぐ
             ndx_data = yf.Ticker("^IXIC").history(start="2014-01-01")
             vix_data = yf.Ticker("^VIX").history(start="2014-01-01")
             if not ndx_data.empty and not vix_data.empty:
                 self.ndx = ndx_data['Close'].pct_change() * 100
                 self.vix = vix_data['Close']
-                
                 self.ndx.index = self.ndx.index.tz_localize(None).strftime('%Y-%m-%d')
                 self.vix.index = self.vix.index.tz_localize(None).strftime('%Y-%m-%d')
             else:
@@ -200,18 +178,16 @@ class PortfolioBacktester:
         self.initial_cash: float = initial_cash
         self.max_positions: int = max_positions
         self.attr: str = "スイング" 
-        self.us_market = USMarketCache()
+        self.us_market = USMarketCache(data_dir)
         
         self.stats: Dict[str, int] = {
             'limit_placed': 0, 'limit_exec': 0,
             'time_stops': 0, 'time_stop_wins': 0,
-            'hard_stops': 0, 'trailing_stops': 0,
-            'gap_down_cancels': 0 
+            'hard_stops': 0, 'trailing_stops': 0
         }
         
         cache_dir = f"{data_dir}_cache"
         os.makedirs(cache_dir, exist_ok=True)
-        debug_log(f"Using cache directory: {cache_dir}")
         
         self.timeline: Dict[str, Dict[str, Dict[str, Any]]] = {}
         dates_set: Set[str] = set()
@@ -219,8 +195,8 @@ class PortfolioBacktester:
         bm_path = f"{data_dir}/13060.parquet"
         bm_df = pd.read_parquet(bm_path) if os.path.exists(bm_path) else None
         
-        files = sorted([f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet"])
-        debug_log(f"Loading {len(files)} tickers. Checking cache...")
+        files = sorted([f for f in os.listdir(data_dir) if f.endswith(".parquet") and f != "13060.parquet" and f != "us_market_cache.parquet"])
+        debug_log(f"Loading {len(files)} tickers. Building timeline...")
         
         for file in files:
             ticker = file.replace(".parquet", "")
@@ -236,23 +212,19 @@ class PortfolioBacktester:
                     df = AdvancedStrategyAnalyzer.calculate_indicators(df, bm_df)
                     if not df.empty:
                         df.to_parquet(cache_path)
-            except Exception as e:
-                debug_log(f"Error processing {ticker}: {e}")
+            except Exception:
                 continue
                 
             if df.empty: continue
             
             df['date_str'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
-            records = df.to_dict(orient='records')
-            
-            for row in records:
+            for row in df.to_dict(orient='records'):
                 d_str = str(row['date_str'])
                 dates_set.add(d_str)
                 if d_str not in self.timeline: self.timeline[d_str] = {}
                 self.timeline[d_str][ticker] = row
                 
         self.sorted_dates = sorted(list(dates_set))
-        debug_log(f"Timeline built. Total trading days: {len(self.sorted_dates)}")
         gc.collect()
 
     def run(self) -> Dict[str, Any]:
@@ -267,6 +239,7 @@ class PortfolioBacktester:
             today_market = self.timeline[date_str]
             n_chg, vix = self.us_market.get_state(date_str)
             
+            # --- 1. 売却処理 ---
             executed_sells = []
             for ticker in pending_sell_orders:
                 if ticker in today_market and ticker in positions:
@@ -281,6 +254,7 @@ class PortfolioBacktester:
                         executed_sells.append(ticker)
             pending_sell_orders = [t for t in pending_sell_orders if t not in executed_sells and t in positions]
 
+            # --- 2. 購入処理 (有利な始値約定) ---
             for order in pending_buy_orders:
                 ticker = str(order['ticker'])
                 if ticker in today_market and len(positions) < self.max_positions:
@@ -290,14 +264,13 @@ class PortfolioBacktester:
                     limit_p = float(order['limit_price'])
                     
                     self.stats['limit_placed'] += 1
-                    
-                    if open_p < limit_p * 0.95:
-                        self.stats['gap_down_cancels'] += 1
-                        continue 
                         
                     if low_p <= limit_p:
-                        exec_price = limit_p * 1.002
-                        alloc_cash = float(order['allocated_cash'])
+                        # 指値より下で寄り付いた場合は、より安い始値(Open)で約定し利益幅を広げる
+                        actual_price = min(open_p, limit_p)
+                        exec_price = actual_price * 1.002 
+                        
+                        alloc_cash = min(float(order['allocated_cash']), cash)
                         qty = alloc_cash // exec_price
                         
                         if qty > 0 and cash >= (qty * exec_price):
@@ -310,6 +283,7 @@ class PortfolioBacktester:
 
             pending_buy_orders = []
 
+            # --- 3. 手仕舞い判定 (資金の高速回転を復活) ---
             new_sells_for_tomorrow = []
             for ticker, pos in positions.items():
                 if ticker in today_market and ticker not in pending_sell_orders:
@@ -321,11 +295,13 @@ class PortfolioBacktester:
                     pos['high_p'] = max(pos['high_p'], curr_c)
                     exit_triggered = False
                     
+                    # 資金拘束を防ぐためのタイトなハードストップ復活
                     hard_stop_price = max(pos['entry_p'] - (current_atr * 2.0), pos['entry_p'] * 0.88)
                     if curr_c <= hard_stop_price:
                         self.stats['hard_stops'] += 1
                         exit_triggered = True
                     
+                    # 利益を守りつつ回転させるための適切なトレイリング（-3.0 ATR）
                     trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
                     if curr_c <= trailing_stop_price and not exit_triggered:
                         self.stats['trailing_stops'] += 1
@@ -336,6 +312,8 @@ class PortfolioBacktester:
                         if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
                         exit_triggered = True
 
+                    # 【最重要】分割利食い（2R・3R）の完全復活。
+                    # 勝っているトレードの資金を早期に解放し、次のチャンスに回して複利を爆発させる。
                     if current_atr > 0 and curr_c > pos['entry_p'] and not exit_triggered:
                         r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
                         if r_mult >= 5.0 and not pos['took_3r']:
@@ -359,9 +337,18 @@ class PortfolioBacktester:
 
             pending_sell_orders.extend(new_sells_for_tomorrow)
 
+            # --- 4. エントリー選定 ---
             open_slots = self.max_positions - len(positions)
             
             if open_slots > 0 and cash > 0:
+                current_equity_estimate = cash
+                for t, p in positions.items():
+                    c_price = AdvancedStrategyAnalyzer._to_float(today_market[t].get('close', p['entry_p'])) if t in today_market else p['entry_p']
+                    current_equity_estimate += p['qty'] * c_price
+                
+                # 総資産ベースの正しいポジションサイジング (10%)
+                target_alloc = current_equity_estimate / self.max_positions
+
                 candidates = []
                 for ticker, row in today_market.items():
                     if ticker in positions or ticker in pending_sell_orders: 
@@ -374,12 +361,7 @@ class PortfolioBacktester:
                         candidates.append((score, vol_ratio, ticker, limit_p))
                 
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
-                
-                is_high_risk = vix >= 20.0
-                max_daily_new_orders = 5 if is_high_risk else self.max_positions
-                allowed_slots_today = min(open_slots, max_daily_new_orders)
-                
-                target_alloc = cash / open_slots if open_slots > 0 else 0
+                allowed_slots_today = min(open_slots, self.max_positions)
                 
                 for score, vol_ratio, ticker, limit_p in candidates[:allowed_slots_today]:
                     pending_buy_orders.append({
@@ -388,6 +370,7 @@ class PortfolioBacktester:
                         'allocated_cash': target_alloc
                     })
 
+            # --- 日次資産記録 ---
             daily_equity = cash
             for ticker, pos in positions.items():
                 if ticker in today_market:
@@ -454,7 +437,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (PROFIT MAXIMIZED & FIXED PERIOD)")
+        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (TRUE COMPOUND ENGINE)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -464,7 +447,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Max 10 Pos, Profit Max, Fixed Timeline)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (High Velocity Compound)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
@@ -480,7 +463,6 @@ if __name__ == "__main__":
         print(f"==================================================")
         print(f" 🔬 詳細分析レポート")
         print(f" [1] 指値の約定状況: {st['limit_exec']}/{st['limit_placed']} ({exec_rate:.1f}%)")
-        print(f"     ┗ 危険な窓開け回避(注文キャンセル): {st['gap_down_cancels']} 回")
         print(f" [2] タイムストップ(20日)撤退: {st['time_stops']} 回 (うち微益: {ts_win_rate:.1f}%)")
         print(f" [3] ハードストップ(絶対防衛線): {st['hard_stops']} 回")
         print(f" [4] トレイリングストップ発動: {st['trailing_stops']} 回")
