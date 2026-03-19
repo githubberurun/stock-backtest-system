@@ -1,10 +1,12 @@
 import os
-import requests
-import pandas as pd
 import time
 import gc
 from typing import Dict, List, Optional, Final, Any
 from datetime import datetime, timedelta
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ==========================================
 # 2025-2026年 最新公式ドキュメント準拠
@@ -26,12 +28,25 @@ def is_recently_updated(filepath: str, hours: int = 12) -> bool:
         return False
 
 class JQuantsV2Fetcher:
-    """J-Quants API v2準拠のデータ取得クラス (堅牢化版)"""
+    """J-Quants API v2準拠 データ取得クラス (絶対フリーズ回避・コネクションプーリング版)"""
     def __init__(self, api_key: str) -> None:
         if not isinstance(api_key, str):
             raise TypeError("API key must be a string")
         self.api_key: str = api_key.strip()
-        self.headers: Dict[str, str] = {"x-api-key": self.api_key}
+        
+        # OSのTCPポート枯渇を防ぐためのセッションと自動リトライ設定
+        self.session = requests.Session()
+        self.session.headers.update({"x-api-key": self.api_key})
+        
+        retry_strategy = Retry(
+            total=3,  # 最大3回リトライ
+            backoff_factor=1.0,  # 1秒, 2秒, 4秒と待機時間を増やす
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def get_safe_start_date(self) -> str:
         safe_date = datetime.now() - timedelta(days=365 * 10 - 1)
@@ -47,7 +62,8 @@ class JQuantsV2Fetcher:
         for _ in range(5):
             params = {"date": target_date.strftime("%Y%m%d")}
             try:
-                response = requests.get(f"{BASE_URL}{ENDPOINT}", headers=self.headers, params=params, timeout=15)
+                # 接続タイムアウト10秒、読み込みタイムアウト30秒を強制
+                response = self.session.get(f"{BASE_URL}{ENDPOINT}", params=params, timeout=(10, 30))
                 if response.status_code == 200:
                     data = response.json().get("data", [])
                     if len(data) > 500:
@@ -56,7 +72,7 @@ class JQuantsV2Fetcher:
                         top_df = df[df['Va_n'] >= 10_000_000].sort_values('Va_n', ascending=False).head(limit)
                         return [str(code)[:4] for code in top_df['Code'].tolist()]
             except Exception as e:
-                print(f"[WARN] Failed to fetch daily data for {target_date}: {e}")
+                print(f"[WARN] Failed to fetch daily data for {target_date}: {type(e).__name__}")
             target_date -= timedelta(days=1)
             time.sleep(1)
             
@@ -83,33 +99,31 @@ class JQuantsV2Fetcher:
             if pagination_key:
                 params["pagination_key"] = pagination_key
 
-            retry_count = 0
-            success = False
-            
-            while retry_count < 3 and not success:
-                try:
-                    response = requests.get(f"{BASE_URL}{ENDPOINT}", headers=self.headers, params=params, timeout=15)
+            try:
+                # デッドロック防止: タイムアウトを厳格に設定
+                response = self.session.get(f"{BASE_URL}{ENDPOINT}", params=params, timeout=(10, 30))
+                
+                if response.status_code == 200:
+                    res_json = response.json()
+                    data_chunk = res_json.get("data", [])
+                    all_data.extend(data_chunk)
+                    pagination_key = res_json.get("pagination_key")
                     
-                    if response.status_code == 200:
-                        success = True
-                        res_json = response.json()
-                        data_chunk = res_json.get("data", [])
-                        all_data.extend(data_chunk)
-                        pagination_key = res_json.get("pagination_key")
-                    elif response.status_code in [403, 429, 500, 502, 503, 504]:
-                        print(f" [API {response.status_code} Wait] ", end="", flush=True)
-                        time.sleep(5)
-                        retry_count += 1
-                    else:
-                        print(f"[ERROR] API {response.status_code}: {response.text}")
-                        break
+                    if not pagination_key:
+                        break # データ取得完了
                         
-                except requests.exceptions.RequestException as e:
-                    print(f" [NetErr Wait] ", end="", flush=True)
-                    time.sleep(5)
-                    retry_count += 1
-            
-            if not success or not pagination_key:
+                elif response.status_code in [401, 403]:
+                    print(f" [API Auth Error: {response.status_code}] ", end="", flush=True)
+                    break # 認証エラーはリトライしても無駄なので即時離脱
+                else:
+                    print(f" [API HTTP {response.status_code}] ", end="", flush=True)
+                    break
+                    
+            except requests.exceptions.Timeout:
+                print(f" [Timeout: Server no response] ", end="", flush=True)
+                break # タイムアウト時は無限ループを避けて当該銘柄の処理を打ち切り、次へ進む
+            except Exception as e:
+                print(f" [Unexpected NetErr: {type(e).__name__}] ", end="", flush=True)
                 break
                 
             time.sleep(0.1)
@@ -152,6 +166,11 @@ class JQuantsV2Fetcher:
             
         return df
 
+    def close(self) -> None:
+        """明示的にセッションを閉じてリソースを解放する"""
+        if self.session:
+            self.session.close()
+
 # ==========================================
 # 空データ・異常値に対する堅牢性証明テスト
 # ==========================================
@@ -162,6 +181,7 @@ def test_integrity() -> None:
     cleaned_empty = dummy_fetcher._clean(df_empty)
     assert cleaned_empty.empty, "Empty DataFrame should return empty DataFrame"
     assert is_recently_updated("non_existent_file.parquet") is False
+    dummy_fetcher.close()
     print("[TEST] All integrity tests passed.")
 
 if __name__ == "__main__":
@@ -174,63 +194,66 @@ if __name__ == "__main__":
         
     fetcher = JQuantsV2Fetcher(key)
     
-    data_dir = "Colog_github"
-    os.makedirs(data_dir, exist_ok=True)
-    
-    TARGET_LIMIT = 600
-    target_tickers = fetcher.get_top_tickers(limit=TARGET_LIMIT)
-    if "13060" not in target_tickers: target_tickers.append("13060")
+    try:
+        data_dir = "Colog_github"
+        os.makedirs(data_dir, exist_ok=True)
         
-    print(f"[INFO] Starting data fetch for {len(target_tickers)} tickers...")
-    
-    for i, target_ticker in enumerate(target_tickers):
-        print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ", flush=True)
-        file_path = f"{data_dir}/{target_ticker}.parquet"
-        
-        # 12時間以内の更新ならAPIを一切叩かず爆速スキップ
-        if is_recently_updated(file_path, hours=12):
-            print("CACHED (Time-Skip)", flush=True)
-            continue
-
-        existing_df = pd.DataFrame()
-        start_date_for_fetch = None
-        
-        # 前回強制終了時に破損したファイルの自己修復リカバリ
-        if os.path.exists(file_path):
-            try:
-                existing_df = pd.read_parquet(file_path)
-                if not existing_df.empty and 'date' in existing_df.columns:
-                    last_date_obj = pd.to_datetime(existing_df['date'].max())
-                    start_date_for_fetch = (last_date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
-            except Exception as e:
-                print(f"[RECOVER] Corrupted cache detected. Re-downloading...", end=" ", flush=True)
-                existing_df = pd.DataFrame()
-        
-        fetched_data = fetcher.fetch(target_ticker, start_date=start_date_for_fetch)
-        
-        try:
-            if not existing_df.empty:
-                if not fetched_data.empty:
-                    combined = pd.concat([existing_df, fetched_data]).drop_duplicates(subset=['date'], keep='last').sort_values('date').reset_index(drop=True)
-                    combined.to_parquet(file_path, index=False)
-                    print(f"UPDATED (Appended {len(fetched_data)} rows)", flush=True)
-                else:
-                    os.utime(file_path, None) # データ更新が無くてもタイムスタンプを現在時刻にしてスキップ対象にする
-                    print("CACHED (Up to date)", flush=True)
-            else:
-                if not fetched_data.empty:
-                    fetched_data.to_parquet(file_path, index=False)
-                    print(f"OK ({len(fetched_data)} rows)", flush=True)
-                else:
-                    print("FAILED (No data)", flush=True)
-        except Exception as e:
-            print(f"FAILED (Write Error: {e})", flush=True)
+        TARGET_LIMIT = 600
+        target_tickers = fetcher.get_top_tickers(limit=TARGET_LIMIT)
+        if "13060" not in target_tickers: target_tickers.append("13060")
             
-        # メモリリーク（OOMキル）を完全に防ぐための明示的なガベージコレクション
-        del existing_df
-        del fetched_data
-        gc.collect()
+        print(f"[INFO] Starting data fetch for {len(target_tickers)} tickers...")
         
-        time.sleep(0.2) # J-Quantsのレートリミットを尊重する安全マージン
+        for i, target_ticker in enumerate(target_tickers):
+            print(f"[{i+1}/{len(target_tickers)}] Fetching {target_ticker}...", end=" ", flush=True)
+            file_path = f"{data_dir}/{target_ticker}.parquet"
+            
+            # 12時間以内の更新ならAPIを一切叩かず爆速スキップ
+            if is_recently_updated(file_path, hours=12):
+                print("CACHED (Time-Skip)", flush=True)
+                continue
+
+            existing_df = pd.DataFrame()
+            start_date_for_fetch = None
+            
+            # 前回強制終了時に破損したファイルの自己修復リカバリ
+            if os.path.exists(file_path):
+                try:
+                    existing_df = pd.read_parquet(file_path)
+                    if not existing_df.empty and 'date' in existing_df.columns:
+                        last_date_obj = pd.to_datetime(existing_df['date'].max())
+                        start_date_for_fetch = (last_date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
+                except Exception as e:
+                    print(f"[RECOVER] Corrupted cache detected. Re-downloading...", end=" ", flush=True)
+                    existing_df = pd.DataFrame()
+            
+            # データ取得実行 (タイムアウト等の例外は内部で安全に処理される)
+            fetched_data = fetcher.fetch(target_ticker, start_date=start_date_for_fetch)
+            
+            try:
+                if not existing_df.empty:
+                    if not fetched_data.empty:
+                        combined = pd.concat([existing_df, fetched_data]).drop_duplicates(subset=['date'], keep='last').sort_values('date').reset_index(drop=True)
+                        combined.to_parquet(file_path, index=False)
+                        print(f"UPDATED (Appended {len(fetched_data)} rows)", flush=True)
+                    else:
+                        os.utime(file_path, None) 
+                        print("CACHED (Up to date)", flush=True)
+                else:
+                    if not fetched_data.empty:
+                        fetched_data.to_parquet(file_path, index=False)
+                        print(f"OK ({len(fetched_data)} rows)", flush=True)
+                    else:
+                        print("FAILED (No data or fetch skipped)", flush=True)
+            except Exception as e:
+                print(f"FAILED (Write Error: {type(e).__name__})", flush=True)
                 
-    print("[INFO] Data fetching process completed.")
+            # メモリリーク（OOMキル）を完全に防ぐための明示的なガベージコレクション
+            del existing_df
+            del fetched_data
+            gc.collect()
+            
+    finally:
+        # プログラム終了時・中断時にセッションを確実に閉じる
+        fetcher.close()
+        print("[INFO] Data fetching process completed and network sessions closed.")
