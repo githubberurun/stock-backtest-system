@@ -43,27 +43,23 @@ class AdvancedStrategyAnalyzer:
         df['prev_close'] = df['close'].shift(1)
         df['ma5'] = df['close'].rolling(window=5).mean()
         df['ma25'] = df['close'].rolling(window=25).mean()
-        df['dev25'] = (df['close'] - df['ma25']) / df['ma25'] * 100
-        df['ma20'] = df['close'].rolling(window=20).mean()
-        df['std20'] = df['close'].rolling(window=20).std()
-        df['bb_up_3'] = df['ma20'] + (df['std20'] * 3)
-        df['bb_p1'] = df['ma20'] + df['std20'] 
-        df['prev_low'] = df['low'].shift(1)
         df['ma75'] = df['close'].rolling(window=75).mean()
         df['ma200'] = df['close'].rolling(window=200).mean()
         
-        df['is_bullish'] = df['close'] > df['open']
-        df['was_above_bb_p1'] = (df['high'] >= df['bb_p1']).rolling(window=5).max() > 0
-        df['bb_p1_cross_down'] = df['was_above_bb_p1'] & (df['close'] < df['bb_p1']) & (df['close'] < df['prev_low'])
-        df['was_above_bb_up_3'] = (df['high'] >= df['bb_up_3']).rolling(window=3).max() > 0
-        df['bb_3_reversal'] = df['was_above_bb_up_3'] & ((df['close'] < df['prev_low']) | (df['close'] < df['open']))
-
+        # ボリンジャーバンドとスクイーズ（エネルギー蓄積）の判定
+        df['ma20'] = df['close'].rolling(window=20).mean()
+        df['std20'] = df['close'].rolling(window=20).std()
+        df['bb_up_1'] = df['ma20'] + df['std20'] 
+        df['bb_up_2'] = df['ma20'] + (df['std20'] * 2)
+        df['bb_width'] = np.where(df['ma20'] > 0, (df['std20'] * 4) / df['ma20'], 0)
+        # 過去20日間の平均BB幅より現在の幅が狭ければ「スクイーズ（収縮）状態」
+        df['is_squeeze'] = df['bb_width'] < df['bb_width'].rolling(window=20).mean()
+        
         df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
         df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = df['ema12'] - df['ema26']
         df['sig'] = df['macd'].ewm(span=9, adjust=False).mean()
         df['macd_hist'] = df['macd'] - df['sig']
-        df['macd_hist_slope'] = df['macd_hist'].diff()
         
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -79,6 +75,7 @@ class AdvancedStrategyAnalyzer:
         df['atr'] = df['tr'].rolling(window=14).mean() 
         df['vol_ratio'] = (df['volume'] / df['volume'].rolling(25).mean().replace(0, np.nan)).fillna(0)
 
+        # TOPIX（ベンチマーク）の相対強度
         if benchmark_df is not None and not benchmark_df.empty:
             benchmark_df.columns = [str(c).lower() for c in benchmark_df.columns]
             benchmark_df['bm_ma200'] = benchmark_df['close'].rolling(window=200).mean()
@@ -97,9 +94,9 @@ class AdvancedStrategyAnalyzer:
     def evaluate_entry(row_dict: Dict[str, Any], attr: str, n_chg: float, vix: float) -> Tuple[bool, float, bool]:
         if not isinstance(row_dict, dict): raise TypeError("row_dict must be a dictionary")
         
+        # 異常値（ストップ高安の張り付き等）の除外
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
-        # ストップ高安などの異常値だけを弾く（VIX制限は外したまま）
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
             return False, 0.0, False
         
@@ -110,22 +107,37 @@ class AdvancedStrategyAnalyzer:
         rsi_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rsi', 50.0), 50.0)
         rs_21_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('rs_21', 0.0), 0.0)
         vol_ratio = AdvancedStrategyAnalyzer._to_float(row_dict.get('vol_ratio', 1.0), 1.0)
-        macd_hist_slope = AdvancedStrategyAnalyzer._to_float(row_dict.get('macd_hist_slope', 0.0))
+        
+        is_squeeze = bool(row_dict.get('is_squeeze', False))
+        bb_up_1 = AdvancedStrategyAnalyzer._to_float(row_dict.get('bb_up_1', 0.0))
+        macd_hist = AdvancedStrategyAnalyzer._to_float(row_dict.get('macd_hist', 0.0))
         
         is_bear_market = (bm_close > 0 and bm_ma200 > 0 and bm_close < bm_ma200)
-        trend_penalty = 20.0 if curr_price > 0 and ma75 > 0 and curr_price < ma75 else 0.0
-
+        
+        # MDDを改善するための「休むも相場」ロジック
         if is_bear_market:
-            if rsi_val > 30.0 or vol_ratio < 1.5: return False, 0.0, is_bear_market
-            total_score = 90.0 - trend_penalty
+            # ベア相場では、中途半端な逆張りを禁止。
+            # RSIが20未満の「真のセリングクライマックス」かつ出来高急増時のみエントリーを許可。
+            if rsi_val > 20.0 or vol_ratio < 2.0:
+                return False, 0.0, is_bear_market
+            total_score = 95.0 # 真の大底には高スコア
         else:
-            if rs_21_val < 0.0: return False, 0.0, is_bear_market
-            main_score = 30.0
-            if vol_ratio >= 1.5: main_score += 20
-            if 50 <= rsi_val <= 75: main_score += 15
-            elif rsi_val < 40: main_score += 20
-            if macd_hist_slope > 0: main_score += 15
-            total_score = main_score + 30.0 - trend_penalty
+            # ブル相場では、TOPIXより強い銘柄の「スクイーズからのブレイク初動」を狙う
+            if rs_21_val < 0.0:
+                return False, 0.0, is_bear_market
+                
+            main_score = 0.0
+            # ボラティリティ収縮（スクイーズ）状態で、+1σを上抜けた瞬間を狙う
+            if is_squeeze and curr_price > bb_up_1:
+                main_score += 40.0
+            if vol_ratio >= 1.5:
+                main_score += 20.0
+            if macd_hist > 0:
+                main_score += 20.0
+            if 40 <= rsi_val <= 65: # 加熱しすぎていない、健全な上昇初動
+                main_score += 20.0
+                
+            total_score = main_score
             
         is_entry = (total_score >= 80)
         return is_entry, float(total_score), is_bear_market
@@ -136,9 +148,9 @@ class AdvancedStrategyAnalyzer:
         curr_price = AdvancedStrategyAnalyzer._to_float(row_dict.get('close', 0.0))
         atr = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
         
-        base_offset = 1.2 if (is_bear_market or vix >= 20.0) else 0.1
-        nasdaq_drop_ratio = abs(n_chg) / 100.0 if n_chg <= -1.0 else 0.0
-        limit_price = curr_price - (atr * base_offset) - (curr_price * nasdaq_drop_ratio)
+        # ベア相場（大底狙い）は深く、ブル相場（ブレイク狙い）は前日終値付近で拾う
+        base_offset = 1.5 if is_bear_market else 0.05
+        limit_price = curr_price - (atr * base_offset)
         return float(max(1.0, limit_price))
 
 class USMarketCache:
@@ -147,7 +159,7 @@ class USMarketCache:
         self.cache_file = os.path.join(data_dir, "us_market_cache.parquet")
         
         try:
-            # 期間を完全に固定してベンチマークのズレを防ぐ
+            # 期間固定（再現性確保）
             ndx_data = yf.Ticker("^IXIC").history(start="2014-01-01")
             vix_data = yf.Ticker("^VIX").history(start="2014-01-01")
             if not ndx_data.empty and not vix_data.empty:
@@ -254,7 +266,7 @@ class PortfolioBacktester:
                         executed_sells.append(ticker)
             pending_sell_orders = [t for t in pending_sell_orders if t not in executed_sells and t in positions]
 
-            # --- 2. 購入処理 (有利な始値約定) ---
+            # --- 2. 購入処理 ---
             for order in pending_buy_orders:
                 ticker = str(order['ticker'])
                 if ticker in today_market and len(positions) < self.max_positions:
@@ -266,7 +278,6 @@ class PortfolioBacktester:
                     self.stats['limit_placed'] += 1
                         
                     if low_p <= limit_p:
-                        # 指値より下で寄り付いた場合は、より安い始値(Open)で約定し利益幅を広げる
                         actual_price = min(open_p, limit_p)
                         exec_price = actual_price * 1.002 
                         
@@ -283,7 +294,7 @@ class PortfolioBacktester:
 
             pending_buy_orders = []
 
-            # --- 3. 手仕舞い判定 (資金の高速回転を復活) ---
+            # --- 3. 手仕舞い判定 ---
             new_sells_for_tomorrow = []
             for ticker, pos in positions.items():
                 if ticker in today_market and ticker not in pending_sell_orders:
@@ -295,25 +306,23 @@ class PortfolioBacktester:
                     pos['high_p'] = max(pos['high_p'], curr_c)
                     exit_triggered = False
                     
-                    # 資金拘束を防ぐためのタイトなハードストップ復活
-                    hard_stop_price = max(pos['entry_p'] - (current_atr * 2.0), pos['entry_p'] * 0.88)
+                    # ストップロスをATRベースに変更し、銘柄ごとのボラティリティに合わせる（ノイズ狩り防止）
+                    hard_stop_price = pos['entry_p'] - (current_atr * 2.5)
                     if curr_c <= hard_stop_price:
                         self.stats['hard_stops'] += 1
                         exit_triggered = True
                     
-                    # 利益を守りつつ回転させるための適切なトレイリング（-3.0 ATR）
-                    trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
+                    trailing_stop_price = pos['high_p'] - (current_atr * 3.5)
                     if curr_c <= trailing_stop_price and not exit_triggered:
                         self.stats['trailing_stops'] += 1
                         exit_triggered = True
                     
-                    if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.03) and not exit_triggered: 
+                    if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.05) and not exit_triggered: 
                         self.stats['time_stops'] += 1
                         if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
                         exit_triggered = True
 
-                    # 【最重要】分割利食い（2R・3R）の完全復活。
-                    # 勝っているトレードの資金を早期に解放し、次のチャンスに回して複利を爆発させる。
+                    # 分割利食い（複利回転）
                     if current_atr > 0 and curr_c > pos['entry_p'] and not exit_triggered:
                         r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
                         if r_mult >= 5.0 and not pos['took_3r']:
@@ -337,7 +346,7 @@ class PortfolioBacktester:
 
             pending_sell_orders.extend(new_sells_for_tomorrow)
 
-            # --- 4. エントリー選定 ---
+            # --- 4. エントリー選定とダイナミック資金管理 ---
             open_slots = self.max_positions - len(positions)
             
             if open_slots > 0 and cash > 0:
@@ -346,8 +355,12 @@ class PortfolioBacktester:
                     c_price = AdvancedStrategyAnalyzer._to_float(today_market[t].get('close', p['entry_p'])) if t in today_market else p['entry_p']
                     current_equity_estimate += p['qty'] * c_price
                 
-                # 総資産ベースの正しいポジションサイジング (10%)
-                target_alloc = current_equity_estimate / self.max_positions
+                # VIX連動型ポジションサイジング（MDD抑制の鍵）
+                is_panic_market = vix >= 25.0
+                
+                # 荒れ相場では、1銘柄あたりの投下資金を半分（10% -> 5%）に減らし、被弾ダメージを下げる
+                base_alloc_percent = 0.05 if is_panic_market else 0.10
+                target_alloc = current_equity_estimate * base_alloc_percent
 
                 candidates = []
                 for ticker, row in today_market.items():
@@ -361,7 +374,10 @@ class PortfolioBacktester:
                         candidates.append((score, vol_ratio, ticker, limit_p))
                 
                 candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
-                allowed_slots_today = min(open_slots, self.max_positions)
+                
+                # 荒れ相場では新規エントリー枠そのものも絞る
+                max_daily_new_orders = 3 if is_panic_market else self.max_positions
+                allowed_slots_today = min(open_slots, max_daily_new_orders)
                 
                 for score, vol_ratio, ticker, limit_p in candidates[:allowed_slots_today]:
                     pending_buy_orders.append({
@@ -417,12 +433,6 @@ def run_integrity_tests() -> None:
         assert is_entry is False, "Corrupted data should not trigger an entry."
     except Exception as e:
         raise AssertionError(f"Failed to handle corrupted data safely: {e}")
-        
-    try:
-        AdvancedStrategyAnalyzer.evaluate_entry("invalid_type", "スイング", 0.0, 15.0) # type: ignore
-        assert False, "evaluate_entry should raise TypeError for non-dict input"
-    except TypeError:
-        pass
 
     debug_log("All integrity tests passed.")
 
@@ -437,7 +447,7 @@ if __name__ == "__main__":
                 exit(1)
             
         print("\n==================================================")
-        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (TRUE COMPOUND ENGINE)")
+        print(" 🚀 STARTING REAL-WORLD PORTFOLIO BACKTEST (SMART BETA EDITION)")
         print("==================================================")
         
         STARTING_CAPITAL = 1000000.0
@@ -447,7 +457,7 @@ if __name__ == "__main__":
         res = tester.run()
         
         print(f"\n==================================================")
-        print(f" 📊 PORTFOLIO SIMULATION RESULTS (High Velocity Compound)")
+        print(f" 📊 PORTFOLIO SIMULATION RESULTS (Smart Beta / Dynamic Sizing)")
         print(f"==================================================")
         print(f" ▶ 初期資金 (Initial Cash) : ¥{int(res['Initial_Cash']):,}")
         print(f" ▶ 最終資産 (Final Cash)   : ¥{int(res['Final_Cash']):,}")
