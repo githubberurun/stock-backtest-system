@@ -7,12 +7,32 @@ env:
   # Node.js 20の非推奨警告への対応 (Node.js 24への強制移行フラグ)
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# ==========================================
+# 2025-2026年 最新公式ドキュメント準拠
+# GitHub Actions Cache: https://docs.github.com/ja/actions/using-workflows/caching-dependencies-to-speed-up-workflows
+# ==========================================
+
 jobs:
   run-system:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # --- 改修箇所 1: キャッシュの復元 ---
+      # 過去の実行（または途中で落ちた実行）で保存されたデータを復元する
+      - name: Restore data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            Colog_github
+            Colog_github_cache
+            data
+          # run_id と run_attempt をキーに含めることで実行ごとに一意にし、
+          # リストア時は前方一致(restore-keys)で最新の取得済みデータを引っ張る
+          key: jquants-data-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            jquants-data-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,12 +63,26 @@ jobs:
           # 2. 統合バックテスト実行
           python -u backtest_runner.py
 
+      # --- 改修箇所 2: キャッシュの保存 ---
+      # Execute PipelineがOOMキル等で失敗(Failed)した場合でも、必ず取得済みの最新データを保存する
+      - name: Save data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            Colog_github
+            Colog_github_cache
+            data
+          key: jquants-data-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # --- 改修箇所 3: 対象フォルダの修正 ---
       - name: Upload Results
         if: always() # エラーが起きても可能な限り結果をアップロード
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
           path: |
+            Colog_github/*.parquet
             data/*.parquet
             data/*.txt
             data/*.csv
