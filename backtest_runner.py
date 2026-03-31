@@ -99,7 +99,7 @@ class AdvancedStrategyAnalyzer:
         
         tr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('tr', 0.0))
         atr_val = AdvancedStrategyAnalyzer._to_float(row_dict.get('atr', 0.0))
-        # ストップ高安などの異常値だけを弾く（VIX制限は外したまま）
+        # ストップ高安などの異常値だけを弾く
         if atr_val > 0 and (tr_val / atr_val) >= 2.5:
             return False, 0.0, False
         
@@ -283,7 +283,7 @@ class PortfolioBacktester:
 
             pending_buy_orders = []
 
-            # --- 3. 手仕舞い判定 (資金の高速回転を復活) ---
+            # --- 3. 手仕舞い判定 (ピーク寄せ: 動的トレイリングストップ実装) ---
             new_sells_for_tomorrow = []
             for ticker, pos in positions.items():
                 if ticker in today_market and ticker not in pending_sell_orders:
@@ -295,25 +295,44 @@ class PortfolioBacktester:
                     pos['high_p'] = max(pos['high_p'], curr_c)
                     exit_triggered = False
                     
-                    # 資金拘束を防ぐためのタイトなハードストップ復活
+                    # 資金拘束を防ぐためのタイトなハードストップ
                     hard_stop_price = max(pos['entry_p'] - (current_atr * 2.0), pos['entry_p'] * 0.88)
                     if curr_c <= hard_stop_price:
                         self.stats['hard_stops'] += 1
                         exit_triggered = True
                     
-                    # 利益を守りつつ回転させるための適切なトレイリング（-3.0 ATR）
-                    trailing_stop_price = pos['high_p'] - (current_atr * 3.0)
-                    if curr_c <= trailing_stop_price and not exit_triggered:
+                    # --- 改修箇所: 動的トレイリングストップ (Dynamic Trailing Stop) ---
+                    # 利益幅（ATRの何倍か）を計算
+                    if current_atr > 0:
+                        profit_atr_multiple = (pos['high_p'] - pos['entry_p']) / current_atr
+                    else:
+                        profit_atr_multiple = 0.0
+
+                    # 利益が乗るにつれて許容するドローダウン幅(ATR倍率)を狭め、ピークに寄せる
+                    if profit_atr_multiple >= 4.0:
+                        trail_multiplier = 1.0  # ピークから1ATR下がったら即利確（超タイト）
+                    elif profit_atr_multiple >= 2.0:
+                        trail_multiplier = 1.5  # 含み益が出たら1.5ATRで利確（タイト）
+                    else:
+                        trail_multiplier = 2.5  # 初期段階はノイズを避けるため広め（元の3.0から2.5へ調整）
+
+                    trailing_stop_price = pos['high_p'] - (current_atr * trail_multiplier)
+                    
+                    # --- 改修箇所: 短期的なモメンタム消失(5日線割れ)による早期利確 ---
+                    ma5 = AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0.0))
+                    momentum_lost = (curr_c < ma5) and (profit_atr_multiple >= 2.0)
+
+                    if (curr_c <= trailing_stop_price or momentum_lost) and not exit_triggered:
                         self.stats['trailing_stops'] += 1
                         exit_triggered = True
+                    # -------------------------------------------------------------
                     
                     if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.03) and not exit_triggered: 
                         self.stats['time_stops'] += 1
                         if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
                         exit_triggered = True
 
-                    # 【最重要】分割利食い（2R・3R）の完全復活。
-                    # 勝っているトレードの資金を早期に解放し、次のチャンスに回して複利を爆発させる。
+                    # 分割利食い（2R・3R）
                     if current_atr > 0 and curr_c > pos['entry_p'] and not exit_triggered:
                         r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
                         if r_mult >= 5.0 and not pos['took_3r']:
