@@ -283,7 +283,7 @@ class PortfolioBacktester:
 
             pending_buy_orders = []
 
-            # --- 3. 手仕舞い判定 (ピーク寄せ: 動的トレイリングストップ実装) ---
+            # --- 3. 手仕舞い判定 (バランス型動的トレイリングストップ) ---
             new_sells_for_tomorrow = []
             for ticker, pos in positions.items():
                 if ticker in today_market and ticker not in pending_sell_orders:
@@ -301,38 +301,35 @@ class PortfolioBacktester:
                         self.stats['hard_stops'] += 1
                         exit_triggered = True
                     
-                    # --- 改修箇所: 動的トレイリングストップ (Dynamic Trailing Stop) ---
+                    # --- 改修箇所: バランス型動的トレイリングストップ ---
                     # 利益幅（ATRの何倍か）を計算
                     if current_atr > 0:
                         profit_atr_multiple = (pos['high_p'] - pos['entry_p']) / current_atr
                     else:
                         profit_atr_multiple = 0.0
 
-                    # 利益が乗るにつれて許容するドローダウン幅(ATR倍率)を狭め、ピークに寄せる
-                    if profit_atr_multiple >= 4.0:
-                        trail_multiplier = 1.0  # ピークから1ATR下がったら即利確（超タイト）
-                    elif profit_atr_multiple >= 2.0:
-                        trail_multiplier = 1.5  # 含み益が出たら1.5ATRで利確（タイト）
+                    # 利益が乗るにつれて許容するドローダウン幅を狭めるが、
+                    # ノイズに耐えられるよう最大でも2.0 ATRまでに留め、初期は3.0 ATRで広く取る。
+                    if profit_atr_multiple >= 6.0:
+                        trail_multiplier = 2.0  # 特大の利益（+6ATR以上）が出たら、2.0ATRまで狭めてピーク寄せ
+                    elif profit_atr_multiple >= 3.0:
+                        trail_multiplier = 2.5  # しっかり利益（+3ATR以上）が出たら、2.5ATRまで狭める
                     else:
-                        trail_multiplier = 2.5  # 初期段階はノイズを避けるため広め（元の3.0から2.5へ調整）
+                        trail_multiplier = 3.0  # 初期段階はダマシを避けるため広い3.0ATRを維持する
 
                     trailing_stop_price = pos['high_p'] - (current_atr * trail_multiplier)
                     
-                    # --- 改修箇所: 短期的なモメンタム消失(5日線割れ)による早期利確 ---
-                    ma5 = AdvancedStrategyAnalyzer._to_float(row.get('ma5', 0.0))
-                    momentum_lost = (curr_c < ma5) and (profit_atr_multiple >= 2.0)
-
-                    if (curr_c <= trailing_stop_price or momentum_lost) and not exit_triggered:
+                    if curr_c <= trailing_stop_price and not exit_triggered:
                         self.stats['trailing_stops'] += 1
                         exit_triggered = True
-                    # -------------------------------------------------------------
+                    # --------------------------------------------------
                     
                     if pos['days_held'] >= 20 and curr_c < (pos['entry_p'] * 1.03) and not exit_triggered: 
                         self.stats['time_stops'] += 1
                         if curr_c > pos['entry_p']: self.stats['time_stop_wins'] += 1
                         exit_triggered = True
 
-                    # 分割利食い（2R・3R）
+                    # 分割利食い（2R・3R）の完全維持
                     if current_atr > 0 and curr_c > pos['entry_p'] and not exit_triggered:
                         r_mult = (curr_c - pos['entry_p']) / (current_atr * 2)
                         if r_mult >= 5.0 and not pos['took_3r']:
